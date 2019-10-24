@@ -75,7 +75,13 @@ init([{Host, Port}, Path, mahi_plus_token, Token]) ->
 disconnected(enter, _, _S) ->
     keep_state_and_data;
 disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path = Path}) ->
-    {ok, Gun} = gun:open(Host, Port),
+    {ok, Gun} = gun:open(Host, Port, #{
+        transport_opts => [
+            {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
+            {keepalive, true}
+        ],
+        retry => 0
+    }),
     {ok, _} = gun:await_up(Gun),
     MRef = monitor(process, Gun),
     S1 = S0#state{gun = Gun, mref = MRef},

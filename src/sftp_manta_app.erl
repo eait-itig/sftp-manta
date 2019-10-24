@@ -224,11 +224,17 @@ login(User, S = #state{amode = mahi_plus_token}) ->
             TokenKey = proplists:get_value(key, TokenConfig),
             TokenIV = proplists:get_value(iv, TokenConfig),
 
-            TokenEnc = crypto:crypto_one_time(aes_128_cbc, <<TokenKey:128/big>>,
-                <<TokenIV:128/big>>, TokenPadded, true),
+            TokenEnc = crypto:block_encrypt(aes_cbc128, <<TokenKey:128/big>>,
+                <<TokenIV:128/big>>, TokenPadded),
             Token = base64:encode(TokenEnc),
 
-            {ok, Gun} = gun:open(S#state.host, S#state.port),
+            {ok, Gun} = gun:open(S#state.host, S#state.port, #{
+                transport_opts => [
+                    {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
+                    {keepalive, true}
+                ],
+                retry => 0
+            }),
             {ok, _} = gun:await_up(Gun, 30000),
 
             S#state{user = User, mahi = MahiGun, gun = Gun, token = Token}

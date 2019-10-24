@@ -39,7 +39,11 @@ init([]) ->
         {key_cb, {sftp_manta_app, []}},
         {preferred_algorithms, [
             {public_key, ['ecdsa-sha2-nistp256']}
-        ]}
+        ]},
+	{recbuf, 128*1024},
+	{sndbuf, 128*1024},
+	{buffer, 256*1024},
+	{keepalive, true}
     ],
     ListenPort = application:get_env(sftp_manta, listen_port, 2222),
     ChildSpecs = [
