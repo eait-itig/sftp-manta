@@ -4,7 +4,19 @@
  {<<"gun">>,{pkg,<<"gun">>,<<"1.3.0">>},0},
  {<<"http_signature">>,{pkg,<<"http_signature">>,<<"2.0.0">>},0},
  {<<"jsx">>,{pkg,<<"jsx">>,<<"2.10.0">>},0},
- {<<"lager">>,{pkg,<<"lager">>,<<"3.8.0">>},0}]}.
+ {<<"kerlberos">>,
+  {git,"https://github.com/arekinath/kerlberos",
+       {ref,"0d45713961111b2284a9b632839729e99312f0d5"}},
+  0},
+ {<<"lager">>,{pkg,<<"lager">>,<<"3.8.0">>},0},
+ {<<"neotoma">>,
+  {git,"git://github.com/seancribbs/neotoma",
+       {ref,"9e57d8ebd4ebb02c3e2428b08f3a01e2ff834ce2"}},
+  1},
+ {<<"pbkdf2">>,
+  {git,"git://github.com/whitelynx/erlang-pbkdf2",
+       {ref,"ab904ed24ffff8510c8bfccc01016bc53daaf94d"}},
+  1}]}.
 [
 {pkg_hash,[
  {<<"cowlib">>, <<"8AA629F81A0FC189F261DC98A42243FA842625FEEA3C7EC56C48F4CCDB55490F">>},

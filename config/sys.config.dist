@@ -1,0 +1,37 @@
+[
+	{sftp_manta, [
+		{listen_port, 2222},
+		{host_key_file, "config/hostkey_ecdsa"},
+
+		{manta, [
+			{host, "stluc.manta.uqcloud.net"},
+			{port, 443}
+		]},
+
+		%{auth_mode, operator},
+		%{auth_key_file, "config/authkey_ecdsa"},
+		%{auth_operator, "xlex"},
+
+		{auth_mode, mahi_plus_token},
+		{token_auth, [
+			{key, 16#1234},
+			{iv, 16#1234}
+		]},
+		{mahi, [
+			{host, "localhost"},
+			{port, 8080}
+		]},
+
+		{krb5, [
+			{realm, "KRB5.UQ.EDU.AU"},
+			%{kdc, ["kdc1.domain"]},
+			%{ciphers, [aes256_hmac_sha1, aes128_hmac_sha1, rc4_hmac]},
+			{timeout, 2000}
+		]}
+	]},
+	{lager, [
+		{handlers, [
+			{lager_console_backend, [{level, debug}]}
+		]}
+	]}
+].

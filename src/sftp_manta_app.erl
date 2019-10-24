@@ -15,7 +15,7 @@
 
 -export([start/2, stop/1]).
 -export([host_key/2, is_auth_key/3]).
--export([login/2, close/2, delete/2, del_dir/2, get_cwd/1, is_dir/2, list_dir/2, 
+-export([login/2, logout/1, close/2, delete/2, del_dir/2, get_cwd/1, is_dir/2, list_dir/2, 
      make_dir/2, make_symlink/3, open/3, position/3, read/3,
      read_file_info/2, read_link/2, read_link_info/2, rename/3,
      write/3, write_file_info/3]).
@@ -28,39 +28,117 @@ stop(_State) ->
     ok.
 
 host_key('ecdsa-sha2-nistp256', _Opts) ->
-    [KeyEntry] = public_key:pem_decode(<<"
------BEGIN EC PRIVATE KEY-----
-MHgCAQEEIQDlnhegeIWq5/2XeX947UmiGbSnLiHYpnZOeJrcxvLxTqAKBggqhkjO
-PQMBB6FEA0IABBkBzZvS0Qzxkfs7fPej0kaddUWzTgDAJOL0sMXRRmpDJPDceAW9
-rJnbf6HwxvMsNIZbdD8Qm6PKZ3f1XPhQ21o=
------END EC PRIVATE KEY-----
-    ">>),
+    {ok, KeyPath} = application:get_env(sftp_manta, host_key_file),
+    {ok, Pem} = file:read_file(KeyPath),
+    [KeyEntry] = public_key:pem_decode(Pem),
     Key = #'ECPrivateKey'{} = public_key:pem_entry_decode(KeyEntry),
     {ok, Key};
 host_key(Alg, _Opts) ->
     {error, {no_key_for_alg, Alg}}.
 
+mahi_get_auth_user(User) ->
+    MahiHostInfo = application:get_env(sftp_manta, mahi, []),
+    MahiHost = proplists:get_value(host, MahiHostInfo),
+    MahiPort = proplists:get_value(port, MahiHostInfo, 80),
+    {ok, MahiGun} = gun:open(MahiHost, MahiPort),
+    {ok, _} = gun:await_up(MahiGun, 15000),
+    Qs = uri_string:compose_query([{"login", User}]),
+    Uri = iolist_to_binary(["/users?", Qs]),
+    InHdrs = [{<<"accept">>, <<"application/json">>}],
+    Stream = gun:get(MahiGun, Uri, InHdrs),
+    Ret = case gun:await(MahiGun, Stream, 10000) of
+        {response, nofin, Status, Headers} when (Status < 300) ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := <<"application/json">>} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
+            #{<<"account">> := Account} = jsx:decode(Body, [return_maps]),
+            {ok, Account};
+        {response, nofin, Status, Headers} ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 30000),
+            ErrInfo = case ContentType of
+                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                _ -> {http, Status, Body}
+            end,
+            {error, ErrInfo};
+        {response, fin, Status, Headers} ->
+            {error, {http, Status}}
+    end,
+    gun:close(MahiGun),
+    Ret.
+
 is_auth_key(PubKey, User, _Opts) ->
-    true.
+    HSKey = http_signature_key:from_record(PubKey),
+    Fp = http_signature_key:fingerprint(HSKey),
+    {ok, Mode} = application:get_env(sftp_manta, auth_mode),
+    case Mode of
+        operator -> false;
+        mahi_plus_token ->
+            case mahi_get_auth_user(User) of
+                {ok, Account} ->
+                    #{<<"keys">> := Keys} = Account,
+                    case Keys of
+                        #{Fp := MahiPem} ->
+                            [Entry] = public_key:pem_decode(MahiPem),
+                            MahiPubKey = public_key:pem_entry_decode(Entry),
+                            case MahiPubKey of
+                                PubKey ->
+                                    lager:debug("authed ~p with key ~p", [User, Fp]),
+                                    true;
+                                _ ->
+                                    lager:warn("key ~p for user ~p matched fp, but not key!", [Fp, User]),
+                                    false
+                            end;
+                        _ -> false
+                    end;
+                {error, Err} ->
+                    lager:debug("mahi returned error looking up user '~s': ~p",
+                        [User, Err]),
+                    false
+            end
+    end.
 
 validate_pw(User, Pw, RemoteAddr, State) ->
-    io:format("~p in ~p\n", [State, self()]),
-    true.
+    Krb5Config = application:get_env(sftp_manta, krb5, []),
+    case proplists:get_value(realm, Krb5Config) of
+        undefined ->
+            lager:debug("~p trying to use password auth", [User]),
+            false;
+        Realm ->
+            Opts = Krb5Config -- [{realm, Realm}],
+            {ok, KrbClient} = krb_client:open(Realm, Opts),
+            case krb_client:authenticate(KrbClient, User, Pw) of
+                ok ->
+                    case mahi_get_auth_user(User) of
+                        {ok, _Account} -> true;
+                        {error, Err} ->
+                            lager:warn("mahi rejected user ~p which krb5 "
+                                "accepted", [User]),
+                            false
+                    end;
+                {error, Why} ->
+                    lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
+                    false
+            end
+    end.
 
 -record(state, {
     user,
+    amode,
     cwd,
     signer,
     token,
     gun,
-    host = "stluc.manta.uqcloud.net",
+    mahi,
+    host,
     port = 443,
     statcache = #{},
     fds = #{},
     next_fd = 10
     }).
 
-request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer}) ->
+request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer, amode = operator}) ->
     Req = http_signature:sign(Signer, Verb, Url, Hdrs0),
     #{headers := Hdrs1} = Req,
     Method = case Verb of
@@ -71,18 +149,25 @@ request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer}) ->
         delete -> "DELETE"
     end,
     Hdrs2 = maps:to_list(Hdrs1),
-    lager:debug("~p ~p (headers = ~p)", [Method, Url, Hdrs2]),
+    gun:request(Gun, Method, Url, Hdrs2);
+request(Verb, Url, Hdrs0, S = #state{gun = Gun, token = Token, amode = mahi_plus_token}) ->
+    Authz = iolist_to_binary([<<"Token ">>, Token]),
+    Hdrs1 = Hdrs0#{<<"authorization">> => Authz},
+    Method = case Verb of
+        head -> "HEAD";
+        get -> "GET";
+        post -> "POST";
+        put -> "PUT";
+        delete -> "DELETE"
+    end,
+    Hdrs2 = maps:to_list(Hdrs1),
     gun:request(Gun, Method, Url, Hdrs2).
 
-login(User, S = #state{}) ->
+login(User, S = #state{amode = operator}) ->
     lager:debug("sftpd starting for user ~p", [User]),
-    [KeyEntry] = public_key:pem_decode(<<"
------BEGIN EC PRIVATE KEY-----
-MHgCAQEEIQDlnhegeIWq5/2XeX947UmiGbSnLiHYpnZOeJrcxvLxTqAKBggqhkjO
-PQMBB6FEA0IABBkBzZvS0Qzxkfs7fPej0kaddUWzTgDAJOL0sMXRRmpDJPDceAW9
-rJnbf6HwxvMsNIZbdD8Qm6PKZ3f1XPhQ21o=
------END EC PRIVATE KEY-----
-    ">>),
+    {ok, KeyPath} = application:get_env(sftp_manta, auth_key_file),
+    {ok, Pem} = file:read_file(KeyPath),
+    [KeyEntry] = public_key:pem_decode(Pem),
     Key = #'ECPrivateKey'{} = public_key:pem_entry_decode(KeyEntry),
     SigKey0 = http_signature_key:from_record(Key),
     Fp = http_signature_key:fingerprint(SigKey0),
@@ -94,11 +179,74 @@ rJnbf6HwxvMsNIZbdD8Qm6PKZ3f1XPhQ21o=
     Signer = http_signature_signer:new(SigKey1, <<"ecdsa-sha256">>,
         [<<"date">>]),
     {ok, Conn} = gun:open(S#state.host, S#state.port),
-    {ok, _} = gun:await_up(Conn),
-    S#state{user = User, signer = Signer, gun = Conn}.
+    {ok, _} = gun:await_up(Conn, 30000),
+    S#state{user = User, signer = Signer, gun = Conn};
+
+login(User, S = #state{amode = mahi_plus_token}) ->
+    lager:debug("sftpd starting for user ~p", [User]),
+    MahiHostInfo = application:get_env(sftp_manta, mahi, []),
+    MahiHost = proplists:get_value(host, MahiHostInfo),
+    MahiPort = proplists:get_value(port, MahiHostInfo, 80),
+    {ok, MahiGun} = gun:open(MahiHost, MahiPort),
+    {ok, _} = gun:await_up(MahiGun, 15000),
+    Qs = uri_string:compose_query([{"login", User}]),
+    Uri = iolist_to_binary(["/accounts?", Qs]),
+    InHdrs = [{<<"accept">>, <<"application/json">>}],
+    Stream = gun:get(MahiGun, Uri, InHdrs),
+    case gun:await(MahiGun, Stream, 10000) of
+        {response, nofin, Status, Headers} when (Status < 300) ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := <<"application/json">>} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
+            #{<<"account">> := Account, <<"roles">> := Roles} =
+                jsx:decode(Body, [return_maps]),
+            #{<<"uuid">> := Uuid, <<"defaultRoles">> := DefaultRoles} = Account,
+            TokenJson = jsx:encode(#{
+                <<"v">> => 2,
+                <<"p">> => #{
+                    <<"account">> => #{
+                        <<"uuid">> => Uuid
+                    },
+                    <<"user">> => null,
+                    <<"roles">> => Roles
+                },
+                <<"c">> => #{
+                    <<"activeRoles">> => DefaultRoles
+                },
+                <<"t">> => erlang:system_time(millisecond)
+            }),
+            TokenGzip = zlib:gzip(TokenJson),
+            PadLen = 16 - (byte_size(TokenGzip) rem 16),
+            Padding = << <<PadLen:8>> || _ <- lists:seq(1, PadLen) >>,
+            TokenPadded = <<TokenGzip/binary, Padding/binary>>,
+
+            TokenConfig = application:get_env(sftp_manta, token_auth, []),
+            TokenKey = proplists:get_value(key, TokenConfig),
+            TokenIV = proplists:get_value(iv, TokenConfig),
+
+            TokenEnc = crypto:crypto_one_time(aes_128_cbc, <<TokenKey:128/big>>,
+                <<TokenIV:128/big>>, TokenPadded, true),
+            Token = base64:encode(TokenEnc),
+
+            {ok, Gun} = gun:open(S#state.host, S#state.port),
+            {ok, _} = gun:await_up(Gun, 30000),
+
+            S#state{user = User, mahi = MahiGun, gun = Gun, token = Token}
+    end.
+
+logout(#state{mahi = undefined, gun = Gun, user = User}) ->
+    lager:debug("~p closed connection", [User]),
+    gun:close(Gun);
+logout(S = #state{mahi = MahiGun}) ->
+    gun:close(MahiGun),
+    logout(S#state{mahi = undefined}).
 
 get_cwd([]) ->
-    {{ok, "/"}, #state{}};
+    MantaHostInfo = application:get_env(sftp_manta, manta, []),
+    MantaHost = proplists:get_value(host, MantaHostInfo),
+    MantaPort = proplists:get_value(port, MantaHostInfo, 443),
+    {ok, Mode} = application:get_env(sftp_manta, auth_mode),
+    {{ok, "/"}, #state{host = MantaHost, port = MantaPort, amode = Mode}};
 get_cwd(S = #state{user = User, cwd = undefined}) ->
     NewCwd = "/" ++ User ++ "/stor",
     {{ok, NewCwd}, S#state{cwd = NewCwd}};
@@ -216,10 +364,12 @@ get_stat(Path, S = #state{statcache = Cache, gun = Gun}) ->
                     Stat = headers_to_file_info(Path, Hdrs),
                     Cache2 = Cache#{Path => #{ts => Now, stat => Stat}},
                     {ok, Stat, S#state{statcache = Cache2}};
-                {response, fin, Status, Headers} when (Status == 404) ->
+                {response, fin, 404, Headers} ->
                     Cache2 = Cache#{Path => #{ts => Now, error => enoent}},
                     {error, enoent, S#state{statcache = Cache2}};
-                {response, fin, Status, Headers} when (Status == 403) ->
+                {response, fin, 403, Headers} ->
+                    {error, eacces, S};
+                {response, fin, 405, Headers} ->
                     {error, eacces, S};
                 {response, fin, Status, Headers} ->
                     lager:debug("stat on ~p returned http ~p", [Path, Status]),
@@ -240,6 +390,9 @@ is_dir(AbsPath, S = #state{}) ->
 list_dir(AbsPath, S) when is_list(AbsPath) ->
     list_dir(unicode:characters_to_binary(AbsPath, utf8), S);
 list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
+    InHdrs = #{
+        <<"accept">> => <<"application/json; type=directory">>
+    },
     Stream = request(get, AbsPath, #{}, S),
     case gun:await(Gun, Stream, 30000) of
         {response, nofin, Status, Headers} when (Status < 300) ->
@@ -264,6 +417,19 @@ list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
 
             Names = [Name || #{ <<"name">> := Name } <- Objs],
             {{ok, Names}, S#state{statcache = Cache1}};
+        {response, nofin, Status, Headers} ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            ErrInfo = case ContentType of
+                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                _ -> {http, Status, Body}
+            end,
+            case ErrInfo of
+                _ ->
+                    lager:debug("list_dir returned ~p", [ErrInfo]),
+                    {{error, ErrInfo}, S}
+            end;
         {response, _Mode, Status, Headers} ->
             gun:cancel(Gun, Stream),
             gun:flush(Stream),
@@ -299,7 +465,17 @@ delete(Path, S = #state{gun = Gun}) ->
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}
             end,
-            {{error, ErrInfo}, S}
+            case ErrInfo of
+                {http, 403, _} ->
+                    {{error, eacces}, S};
+                {http, 404, _} ->
+                    {{error, enoent}, S};
+                {http, 400, #{<<"code">> := <<"DirectoryNotEmpty">>}} ->
+                    {{error, eexist}, S};
+                _ ->
+                    lager:debug("delete returned ~p", [ErrInfo]),
+                    {{error, ErrInfo}, S}
+            end
     end.
 
 del_dir(Path, S = #state{}) ->
@@ -327,7 +503,11 @@ make_dir(Path, S = #state{gun = Gun}) ->
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}
             end,
-            {{error, ErrInfo}, S}
+            case ErrInfo of
+                _ ->
+                    lager:debug("mkdir returned ~p", [ErrInfo]),
+                    {{error, ErrInfo}, S}
+            end
     end.
      
 make_symlink(Path2, Path, S = #state{}) ->
@@ -335,12 +515,18 @@ make_symlink(Path2, Path, S = #state{}) ->
 
 -record(fd_state, {path, fsm}).
 
-open(Path, Flags, S = #state{host = Host, port = Port, signer = Signer}) ->
+open(Path, Flags, S = #state{host = Host, port = Port}) ->
     case lists:member(write, Flags) of
         false ->
             case get_stat(Path, S) of
                 {ok, #file_info{type = regular}, S2} ->
-                    {ok, Fsm} = file_read_fsm:start_link({Host, Port}, Path, Signer),
+                    lager:debug("~p opening ~p for read", [S#state.user, Path]),
+                    {ok, Fsm} = case S2 of
+                        #state{amode = operator, signer = Signer} ->
+                            file_read_fsm:start_link({Host, Port}, Path, operator, Signer);
+                        #state{amode = mahi_plus_token, token = Token} ->
+                            file_read_fsm:start_link({Host, Port}, Path, mahi_plus_token, Token)
+                    end,
                     ok = gen_statem:call(Fsm, connect),
                     Fd = S2#state.next_fd,
                     S3 = S2#state{next_fd = Fd + 1},
@@ -354,7 +540,13 @@ open(Path, Flags, S = #state{host = Host, port = Port, signer = Signer}) ->
                     {{error, Why}, S2}
             end;
         true ->
-            {ok, Fsm} = file_write_fsm:start_link({Host, Port}, Path, Signer),
+            lager:debug("~p opening ~p for write", [S#state.user, Path]),
+            {ok, Fsm} = case S of
+                #state{amode = operator, signer = Signer} ->
+                    file_write_fsm:start_link({Host, Port}, Path, operator, Signer);
+                #state{amode = mahi_plus_token, token = Token} ->
+                    file_write_fsm:start_link({Host, Port}, Path, mahi_plus_token, Token)
+            end,
             ok = gen_statem:call(Fsm, connect),
             Fd = S#state.next_fd,
             S2 = S#state{next_fd = Fd + 1},
@@ -382,9 +574,7 @@ close(Fd, S = #state{fds = Fds0}) ->
 position(Fd, Offs, S = #state{fds = Fds}) ->
     case Fds of
         #{Fd := #fd_state{fsm = Fsm}} ->
-            lager:debug("{position,~p}", [Offs]),
             Res = gen_statem:call(Fsm, {position, Offs}),
-            lager:debug("{position,~p} => ~p", [Offs, Res]),
             {Res, S};
         _ ->
             {{error, ebadf}, S}
@@ -393,12 +583,7 @@ position(Fd, Offs, S = #state{fds = Fds}) ->
 read(Fd, Len, S = #state{fds = Fds}) ->
     case Fds of
         #{Fd := #fd_state{fsm = Fsm, path = Path}} ->
-            lager:debug("{read,~p}", [Len]),
             Res = gen_statem:call(Fsm, {read, Len}),
-            case Res of
-                {ok, Buf} -> lager:debug("{read,~p} => ~p bytes", [Len, size(Buf)]);
-                _ -> lager:debug("{read,~p} => ~p", [Len, Res])
-            end,
             {Res, S};
         _ ->
             {{error, ebadf}, S}
@@ -407,23 +592,58 @@ read(Fd, Len, S = #state{fds = Fds}) ->
 read_link(Path, S = #state{}) ->
     {{error, einval}, S}.
 
-rename(Path, Path2, S = #state{}) ->
-    {{error, einval}, S}.
+rename(Path, Path2, S = #state{gun = Gun}) ->
+    InHdrs = #{
+        <<"accept">> => <<"application/json">>,
+        <<"content-type">> => <<"application/json; type=link">>,
+        <<"content-length">> => <<"0">>,
+        <<"location">> => unicode:characters_to_binary(Path, utf8)
+    },
+    Stream = request(put, Path2, InHdrs, S),
+    case gun:await(Gun, Stream, 30000) of
+        {response, fin, Status, Headers} when (Status < 300) ->
+            #state{statcache = Cache} = S,
+            Cache2 = Cache#{
+                Path => #{ ts => 0, error => enoent },
+                Path2 => #{ ts => 0, error => enoent }
+            },
+            S2 = S#state{statcache = Cache2},
+            delete(Path, S2);
+        {response, fin, Status, Headers} ->
+            lager:debug("putlink returned ~p", [{http, Status}]),
+            {{error, {http, Status}}, S};
+        {response, nofin, Status, Headers} when (Status > 300) ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            ErrInfo = case ContentType of
+                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                _ -> {http, Status, Body}
+            end,
+            case ErrInfo of
+                {http, 400, #{<<"code">> := <<"LinkNotObject">>}} ->
+                    {{error, enotdir}, S};
+                {http, 403, _} ->
+                    {{error, eacces}, S};
+                {http, 404, #{<<"code">> := <<"SourceObjectNotFound">>}} ->
+                    {{error, enoent}, S};
+                _ ->
+                    lager:debug("putlink returned ~p", [ErrInfo]),
+                    {{error, ErrInfo}, S}
+            end
+    end.
 
 write(Fd, Data, S = #state{fds = Fds}) ->
     case Fds of
         #{Fd := #fd_state{fsm = Fsm, path = Path}} ->
             Len = byte_size(Data),
-            lager:debug("{write,~p}", [Len]),
             Res = gen_statem:call(Fsm, {write, Data}),
-            lager:debug("{write,~p} => ~p", [Len, Res]),
             {Res, S};
         _ ->
             {{error, ebadf}, S}
     end.
      
 write_file_info(Path, Info, S = #state{}) ->
-    lager:debug("{write_file_info, ~p, ~p}", [Path, Info]),
     {{error, einval}, S}.
 
 %% internal functions

@@ -12,7 +12,8 @@
     lager,
     gun,
     http_signature,
-    jsx
+    jsx,
+    kerlberos
    ]},
   {env,[]},
   {modules, []},

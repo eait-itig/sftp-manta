@@ -189,7 +189,8 @@ terminate(_, #state{handles=Handles, file_handler=FileMod, file_state=FS}) ->
           (_, FS0) ->
                FS0
            end,
-    lists:foldl(CloseFun, FS, Handles),
+    FS2 = lists:foldl(CloseFun, FS, Handles),
+    FS3 = FileMod:logout(FS2),
     ok.
 
 %%--------------------------------------------------------------------
@@ -490,7 +491,8 @@ nattr_to_longname(NameUC, Attr) ->
         {6, $x}, {7, $w}, {8, $r}]),
     SBin = integer_to_binary(S),
     SBinPad = lists:duplicate(10 - byte_size(SBin), " "),
-    {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:system_time_to_local_time(MTime, second),
+    {{Year, Month, Day}, {Hour, Min, Sec}} =
+        calendar:system_time_to_local_time(MTime, second),
     MTimeString = [month_name(Month), " ", integer_to_binary(Day), "  ",
         integer_to_binary(Year)],
     [Type, PermString, "   1  ", integer_to_binary(O), "     ",

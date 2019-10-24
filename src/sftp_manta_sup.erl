@@ -41,8 +41,9 @@ init([]) ->
             {public_key, ['ecdsa-sha2-nistp256']}
         ]}
     ],
+    ListenPort = application:get_env(sftp_manta, listen_port, 2222),
     ChildSpecs = [
-        #{id => sshd, start => {ssh, daemon, [2222, SSHOpts]}}
+        #{id => sshd, start => {ssh, daemon, [ListenPort, SSHOpts]}}
     ],
     {ok, {SupFlags, ChildSpecs}}.
 

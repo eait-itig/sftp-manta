@@ -5,19 +5,21 @@
 -include_lib("kernel/include/file.hrl").
 -compile([{parse_transform, lager_transform}]).
 
--export([start_link/3]).
+-export([start_link/4]).
 -export([init/1, callback_mode/0]).
 -export([disconnected/3, flowing/3, errored/3]).
 
-start_link({Host, Port}, Path, Signer) ->
-    gen_statem:start_link(?MODULE, [{Host, Port}, Path, Signer], []).
+start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
+    gen_statem:start_link(?MODULE, [{Host, Port}, Path, AuthMode, SignerOrToken], []).
 
 -record(state, {
     host,
     port,
     path,
     gun,
+    amode,
     signer,
+    token,
     stream,
     error,
     waiter,
@@ -27,7 +29,7 @@ start_link({Host, Port}, Path, Signer) ->
 
 callback_mode() -> [state_functions, state_enter].
 
-request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer}) ->
+request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer, amode = operator}) ->
     Req = http_signature:sign(Signer, Verb, Url, Hdrs0),
     #{headers := Hdrs1} = Req,
     Method = case Verb of
@@ -38,7 +40,18 @@ request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer}) ->
         delete -> "DELETE"
     end,
     Hdrs2 = maps:to_list(Hdrs1),
-    lager:debug("~p ~p (headers = ~p)", [Method, Url, Hdrs2]),
+    gun:request(Gun, Method, Url, Hdrs2);
+request(Verb, Url, Hdrs0, S = #state{gun = Gun, token = Token, amode = mahi_plus_token}) ->
+    Authz = iolist_to_binary([<<"Token ">>, Token]),
+    Hdrs1 = Hdrs0#{<<"authorization">> => Authz},
+    Method = case Verb of
+        head -> "HEAD";
+        get -> "GET";
+        post -> "POST";
+        put -> "PUT";
+        delete -> "DELETE"
+    end,
+    Hdrs2 = maps:to_list(Hdrs1),
     gun:request(Gun, Method, Url, Hdrs2).
 
 fn_ext_to_mime(Fname) when is_list(Fname) ->
@@ -72,8 +85,13 @@ fn_ext_to_mime(Fname) ->
         _ -> <<"application/octet-stream">>
     end.
 
-init([{Host, Port}, Path, Signer]) ->
-    S0 = #state{host = Host, port = Port, path = Path, signer = Signer},
+init([{Host, Port}, Path, operator, Signer]) ->
+    S0 = #state{host = Host, port = Port, path = Path,
+        amode = operator, signer = Signer},
+    {ok, disconnected, S0};
+init([{Host, Port}, Path, mahi_plus_token, Token]) ->
+    S0 = #state{host = Host, port = Port, path = Path,
+        amode = mahi_plus_token, token = Token},
     {ok, disconnected, S0}.
 
 disconnected(enter, _, _S) ->
