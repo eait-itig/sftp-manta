@@ -62,7 +62,7 @@ mahi_get_auth_user(User) ->
                 _ -> {http, Status, Body}
             end,
             {error, ErrInfo};
-        {response, fin, Status, Headers} ->
+        {response, fin, Status, _Headers} ->
             {error, {http, Status}}
     end,
     gun:close(MahiGun),
@@ -99,7 +99,7 @@ is_auth_key(PubKey, User, _Opts) ->
             end
     end.
 
-validate_pw(User, Pw, RemoteAddr, State) ->
+validate_pw(User, Pw, _RemoteAddr, _State) ->
     Krb5Config = application:get_env(sftp_manta, krb5, []),
     case proplists:get_value(realm, Krb5Config) of
         undefined ->
@@ -114,7 +114,7 @@ validate_pw(User, Pw, RemoteAddr, State) ->
                         {ok, _Account} -> true;
                         {error, Err} ->
                             lager:warn("mahi rejected user ~p which krb5 "
-                                "accepted", [User]),
+                                "accepted: ~p", [User, Err]),
                             false
                     end;
                 {error, Why} ->
@@ -135,10 +135,11 @@ validate_pw(User, Pw, RemoteAddr, State) ->
     port = 443,
     statcache = #{},
     fds = #{},
-    next_fd = 10
+    next_fd = 10,
+    peer
     }).
 
-request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer, amode = operator}) ->
+request(Verb, Url, Hdrs0, #state{gun = Gun, signer = Signer, amode = operator}) ->
     Req = http_signature:sign(Signer, Verb, Url, Hdrs0),
     #{headers := Hdrs1} = Req,
     Method = case Verb of
@@ -150,7 +151,7 @@ request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer, amode = operato
     end,
     Hdrs2 = maps:to_list(Hdrs1),
     gun:request(Gun, Method, Url, Hdrs2);
-request(Verb, Url, Hdrs0, S = #state{gun = Gun, token = Token, amode = mahi_plus_token}) ->
+request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = mahi_plus_token}) ->
     Authz = iolist_to_binary([<<"Token ">>, Token]),
     Hdrs1 = Hdrs0#{<<"authorization">> => Authz},
     Method = case Verb of
@@ -301,14 +302,15 @@ headers_to_file_info(Path, Hdrs) ->
             FInfo2#file_info{mtime = Mtime, atime = Mtime};
         _ ->
             FInfo2
-    end.
+    end,
+    FInfo3.
 
 isotime_to_datetime(Bin) ->
     <<YearBin:4/binary, "-", MonthBin:2/binary, "-", DayBin:2/binary, "T", TimeBin/binary>> = Bin,
     <<Hour:2/binary, ":", Min:2/binary, ":", Sec:2/binary, Rem/binary>> = TimeBin,
-    _MSec = case Rem of
-        <<"Z">> -> 0;
-        <<".", V:3/binary, "Z">> -> binary_to_integer(V)
+    case Rem of
+        <<"Z">> -> ok;
+        <<".", _:3/binary, "Z">> -> ok
     end,
     Date = {binary_to_integer(YearBin), binary_to_integer(MonthBin),
         binary_to_integer(DayBin)},
@@ -350,7 +352,18 @@ lsobj_to_file_info(Path, LsObj) ->
             FInfo2#file_info{mtime = Mtime, atime = Mtime};
         _ ->
             FInfo2
-    end.
+    end,
+    FInfo3.
+
+fake_new_file_info(_Path) ->
+    #file_info{
+        size = 0,
+        uid = 0, gid = 0,
+        mtime = calendar:local_time(),
+        atime = calendar:local_time(),
+        type = regular,
+        mode = 8#664 bor ?S_IFREG
+    }.
 
 get_stat(Path, S = #state{}) when is_list(Path) ->
     get_stat(unicode:characters_to_binary(Path, utf8), S);
@@ -370,14 +383,14 @@ get_stat(Path, S = #state{statcache = Cache, gun = Gun}) ->
                     Stat = headers_to_file_info(Path, Hdrs),
                     Cache2 = Cache#{Path => #{ts => Now, stat => Stat}},
                     {ok, Stat, S#state{statcache = Cache2}};
-                {response, fin, 404, Headers} ->
+                {response, fin, 404, _} ->
                     Cache2 = Cache#{Path => #{ts => Now, error => enoent}},
                     {error, enoent, S#state{statcache = Cache2}};
-                {response, fin, 403, Headers} ->
+                {response, fin, 403, _} ->
                     {error, eacces, S};
-                {response, fin, 405, Headers} ->
+                {response, fin, 405, _} ->
                     {error, eacces, S};
-                {response, fin, Status, Headers} ->
+                {response, fin, Status, _Headers} ->
                     lager:debug("stat on ~p returned http ~p", [Path, Status]),
                     {error, einval, S}
             end
@@ -389,7 +402,7 @@ is_dir(AbsPath, S = #state{}) ->
             {true, S2};
         {ok, #file_info{}, S2} ->
             {false, S2};
-        {error, Why, S2} ->
+        {error, _Why, S2} ->
             {false, S2}
     end.
 
@@ -399,7 +412,7 @@ list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
     InHdrs = #{
         <<"accept">> => <<"application/json; type=directory">>
     },
-    Stream = request(get, AbsPath, #{}, S),
+    Stream = request(get, AbsPath, InHdrs, S),
     case gun:await(Gun, Stream, 30000) of
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
@@ -436,7 +449,7 @@ list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
                     lager:debug("list_dir returned ~p", [ErrInfo]),
                     {{error, ErrInfo}, S}
             end;
-        {response, _Mode, Status, Headers} ->
+        {response, _Mode, _Status, _Headers} ->
             gun:cancel(Gun, Stream),
             gun:flush(Stream),
             {{error, enotdir}, S}
@@ -456,12 +469,13 @@ read_link_info(Path, S = #state{}) ->
 delete(Path, S = #state{gun = Gun}) ->
     Stream = request(delete, Path, #{}, S),
     case gun:await(Gun, Stream, 30000) of
-        {response, fin, Status, Headers} when (Status < 300) ->
+        {response, fin, Status, _Headers} when (Status < 300) ->
             #state{statcache = Cache} = S,
-            Cache2 = Cache#{ Path => #{ ts => 0, error => enoent } },
+            PathBin = unicode:characters_to_binary(Path, utf8),
+            Cache2 = Cache#{ PathBin => #{ ts => 0, error => enoent } },
             S2 = S#state{statcache = Cache2},
             {ok, S2};
-        {response, fin, Status, Headers} ->
+        {response, fin, Status, _Headers} ->
             {{error, {http, Status}}, S};
         {response, nofin, Status, Headers} when (Status > 300) ->
             Hdrs = maps:from_list(Headers),
@@ -488,42 +502,50 @@ del_dir(Path, S = #state{}) ->
     delete(Path, S).
      
 make_dir(Path, S = #state{gun = Gun}) ->
-    InHdrs = #{
-        <<"content-type">> => <<"application/json; type=directory">>,
-        <<"content-length">> => <<"0">>
-    },
-    Stream = request(put, Path, InHdrs, S),
-    case gun:await(Gun, Stream, 30000) of
-        {response, fin, Status, Headers} when (Status < 300) ->
-            #state{statcache = Cache} = S,
-            Cache2 = Cache#{ Path => #{ ts => 0, error => enoent } },
-            S2 = S#state{statcache = Cache2},
+    case get_stat(Path, S) of
+        {ok, #file_info{type = directory}, S2} ->
             {ok, S2};
-        {response, fin, Status, Headers} ->
-            {{error, {http, Status}}, S};
-        {response, nofin, Status, Headers} when (Status > 300) ->
-            Hdrs = maps:from_list(Headers),
-            #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
-            ErrInfo = case ContentType of
-                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
-                _ -> {http, Status, Body}
-            end,
-            case ErrInfo of
-                _ ->
-                    lager:debug("mkdir returned ~p", [ErrInfo]),
-                    {{error, ErrInfo}, S}
+        {ok, _, S2} ->
+            {{error, eexist}, S2};
+        {error, _, S2} ->
+            InHdrs = #{
+                <<"content-type">> => <<"application/json; type=directory">>,
+                <<"content-length">> => <<"0">>
+            },
+            Stream = request(put, Path, InHdrs, S),
+            case gun:await(Gun, Stream, 30000) of
+                {response, fin, Status, _Headers} when (Status < 300) ->
+                    #state{statcache = Cache} = S,
+                    PathBin = unicode:characters_to_binary(Path, utf8),
+                    Cache2 = Cache#{ PathBin => #{ ts => 0, error => enoent } },
+                    S2 = S#state{statcache = Cache2},
+                    {ok, S2};
+                {response, fin, Status, _Headers} ->
+                    {{error, {http, Status}}, S};
+                {response, nofin, Status, Headers} when (Status > 300) ->
+                    Hdrs = maps:from_list(Headers),
+                    #{<<"content-type">> := ContentType} = Hdrs,
+                    {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+                    ErrInfo = case ContentType of
+                        <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                        _ -> {http, Status, Body}
+                    end,
+                    case ErrInfo of
+                        _ ->
+                            lager:debug("mkdir returned ~p", [ErrInfo]),
+                            {{error, ErrInfo}, S}
+                    end
             end
     end.
      
-make_symlink(Path2, Path, S = #state{}) ->
+make_symlink(_Path2, _Path, S = #state{}) ->
     {{error, enotsup}, S}.
 
 -record(fd_state, {path, fsm}).
 
 open(Path, Flags, S = #state{host = Host, port = Port}) ->
-    case lists:member(write, Flags) of
-        false ->
+    case {lists:member(read, Flags), lists:member(write, Flags)} of
+        {true, false} ->
             case get_stat(Path, S) of
                 {ok, #file_info{type = regular}, S2} ->
                     lager:debug("~p opening ~p for read", [S#state.user, Path]),
@@ -545,8 +567,8 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
                 {error, Why, S2} ->
                     {{error, Why}, S2}
             end;
-        true ->
-            lager:debug("~p opening ~p for write", [S#state.user, Path]),
+        {false, true} ->
+            lager:debug("~p opening ~p for write (~p)", [S#state.user, Path, Flags]),
             {ok, Fsm} = case S of
                 #state{amode = operator, signer = Signer} ->
                     file_write_fsm:start_link({Host, Port}, Path, operator, Signer);
@@ -559,7 +581,16 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
             FdMap = S2#state.fds,
             FS = #fd_state{path = Path, fsm = Fsm},
             S3 = S2#state{fds = FdMap#{Fd => FS}},
-            {{ok, Fd}, S3}
+            Cache = S3#state.statcache,
+            Now = erlang:system_time(millisecond),
+            PathBin = unicode:characters_to_binary(Path, utf8),
+            Cache2 = Cache#{PathBin => #{ts => Now, stat => fake_new_file_info(Path)}},
+            S4 = S3#state{statcache = Cache2},
+            {{ok, Fd}, S4};
+         _ ->
+            lager:debug("~p tried to open ~p with unsupported flags: ~p", [S#state.user,
+                Path, Flags]),
+            {{error, eacces}, S}
     end.
 
 close(Fd, S = #state{fds = Fds0}) ->
@@ -588,14 +619,14 @@ position(Fd, Offs, S = #state{fds = Fds}) ->
 
 read(Fd, Len, S = #state{fds = Fds}) ->
     case Fds of
-        #{Fd := #fd_state{fsm = Fsm, path = Path}} ->
+        #{Fd := #fd_state{fsm = Fsm}} ->
             Res = gen_statem:call(Fsm, {read, Len}),
             {Res, S};
         _ ->
             {{error, ebadf}, S}
     end.
           
-read_link(Path, S = #state{}) ->
+read_link(_Path, S = #state{}) ->
     {{error, einval}, S}.
 
 rename(Path, Path2, S = #state{gun = Gun}) ->
@@ -607,15 +638,17 @@ rename(Path, Path2, S = #state{gun = Gun}) ->
     },
     Stream = request(put, Path2, InHdrs, S),
     case gun:await(Gun, Stream, 30000) of
-        {response, fin, Status, Headers} when (Status < 300) ->
+        {response, fin, Status, _Headers} when (Status < 300) ->
             #state{statcache = Cache} = S,
+            PathBin = unicode:characters_to_binary(Path, utf8),
+            Path2Bin = unicode:characters_to_binary(Path2, utf8),
             Cache2 = Cache#{
-                Path => #{ ts => 0, error => enoent },
-                Path2 => #{ ts => 0, error => enoent }
+                PathBin => #{ ts => 0, error => enoent },
+                Path2Bin => #{ ts => 0, error => enoent }
             },
             S2 = S#state{statcache = Cache2},
             delete(Path, S2);
-        {response, fin, Status, Headers} ->
+        {response, fin, Status, _Headers} ->
             lager:debug("putlink returned ~p", [{http, Status}]),
             {{error, {http, Status}}, S};
         {response, nofin, Status, Headers} when (Status > 300) ->
@@ -641,15 +674,17 @@ rename(Path, Path2, S = #state{gun = Gun}) ->
 
 write(Fd, Data, S = #state{fds = Fds}) ->
     case Fds of
-        #{Fd := #fd_state{fsm = Fsm, path = Path}} ->
-            Len = byte_size(Data),
+        #{Fd := #fd_state{fsm = Fsm}} ->
             Res = gen_statem:call(Fsm, {write, Data}),
             {Res, S};
         _ ->
             {{error, ebadf}, S}
     end.
      
-write_file_info(Path, Info, S = #state{}) ->
-    {{error, einval}, S}.
+write_file_info(Path, _Info, S = #state{}) ->
+    case get_stat(Path, S) of
+        {ok, _, S2} -> {ok, S2};
+        {error, Why, S2} -> {{error, Why}, S2}
+    end.
 
 %% internal functions
