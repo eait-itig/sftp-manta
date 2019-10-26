@@ -95,7 +95,21 @@ is_auth_key(PubKey, User, _Opts) ->
     Fp = http_signature_key:fingerprint(HSKey),
     {ok, Mode} = application:get_env(sftp_manta, auth_mode),
     case Mode of
-        operator -> false;
+        operator ->
+            case application:get_env(sftp_manta, authorized_keys_file) of
+                {ok, Filename} ->
+                    {ok, Data} = file:read_file(Filename),
+                    Keys = public_key:ssh_decode(Data, auth_keys),
+                    Matching = [Attrs || {Key, Attrs} <- Keys, Key =:= PubKey],
+                    lists:any(fun (Attrs) ->
+                        Opts = proplists:get_value(options, Attrs, []),
+                        case Opts of
+                            [] -> true;
+                            _ -> lists:member("user=" ++ User, Opts)
+                        end
+                    end, Matching);
+                _ -> false
+            end;
         mahi_plus_token ->
             case mahi_get_auth_user(User) of
                 {ok, Account} ->

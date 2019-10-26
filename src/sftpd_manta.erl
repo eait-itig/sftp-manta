@@ -492,7 +492,7 @@ nattr_to_longname(NameUC, Attr) ->
     end, [], [{0, $x}, {1, $w}, {2, $r}, {3, $x}, {4, $w}, {5, $r},
         {6, $x}, {7, $w}, {8, $r}]),
     SBin = integer_to_binary(S),
-    SBinPad = lists:duplicate(10 - byte_size(SBin), " "),
+    SBinPad = lists:duplicate(lists:max([0, 12 - byte_size(SBin)]), " "),
     {{Year, Month, Day}, {_Hour, _Min, _Sec}} =
         calendar:system_time_to_local_time(MTime, second),
     MTimeString = [month_name(Month), " ", integer_to_binary(Day), "  ",
