@@ -66,7 +66,7 @@ generate_key({namedCurve, NamedCurve}) when is_atom(NamedCurve) orelse is_binary
 generate_key(NamedCurve = {namedCurve, _}) ->
     public_key:generate_key(NamedCurve).
 
-sign(ECPrivateKey=#'ECPrivateKey'{parameters=ECParameters}, Algorithm, Message) ->
+sign(ECPrivateKey=#'ECPrivateKey'{}, Algorithm, Message) ->
     DigestType = algorithm_to_digest_type(Algorithm),
     public_key:sign(Message, DigestType, ECPrivateKey).
 
@@ -108,25 +108,3 @@ ec_parameters_to_named_curve({namedCurve, P}) ->
     pubkey_cert_records:namedCurves(P);
 ec_parameters_to_named_curve(P) ->
     P.
-
-%% @private
-int_to_bin(X) when X < 0 -> int_to_bin_neg(X, []);
-int_to_bin(X) -> int_to_bin_pos(X, []).
-
-%% @private
-int_to_bin_pos(0,Ds=[_|_]) ->
-    list_to_binary(Ds);
-int_to_bin_pos(X,Ds) ->
-    int_to_bin_pos(X bsr 8, [(X band 255)|Ds]).
-
-%% @private
-int_to_bin_neg(-1, Ds=[MSB|_]) when MSB >= 16#80 ->
-    list_to_binary(Ds);
-int_to_bin_neg(X,Ds) ->
-    int_to_bin_neg(X bsr 8, [(X band 255)|Ds]).
-
-%% @private
-pad(Bin, Size) when byte_size(Bin) =:= Size ->
-    Bin;
-pad(Bin, Size) when byte_size(Bin) < Size ->
-    pad(<< 0, Bin/binary >>, Size).

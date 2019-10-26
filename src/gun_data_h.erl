@@ -36,7 +36,7 @@ handle(IsFin, Data, State=#state{reply_to=ReplyTo, stream_ref=StreamRef}) ->
     ReplyTo ! {gun_data, self(), StreamRef, IsFin, Data, Ref},
     receive
         {gun_data_ack, ReplyTo, StreamRef, Ref} -> ok;
-        {'DOWN', MRef, process, _, Reason} -> ok
+        {'DOWN', MRef, process, _, _Reason} -> ok
     end,
     demonitor(MRef),
     {done, State}.
@@ -54,9 +54,6 @@ await_body(ServerPid, StreamRef, Timeout) ->
     Res = await_body(ServerPid, StreamRef, Timeout, MRef, <<>>),
     demonitor(MRef, [flush]),
     Res.
-
-await_body(ServerPid, StreamRef, Timeout, MRef) ->
-    await_body(ServerPid, StreamRef, Timeout, MRef, <<>>).
 
 await_body(ServerPid, StreamRef, Timeout, MRef, Acc) ->
     receive

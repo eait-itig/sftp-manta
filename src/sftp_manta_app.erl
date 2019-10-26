@@ -573,9 +573,9 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
                     lager:debug("~p opening ~p for read", [S#state.user, Path]),
                     {ok, Fsm} = case S2 of
                         #state{amode = operator, signer = Signer} ->
-                            file_read_fsm:start_link({Host, Port}, Path, operator, Signer);
+                            file_read_fsm:start_link({Host, Port}, Path, signature, Signer);
                         #state{amode = mahi_plus_token, token = Token} ->
-                            file_read_fsm:start_link({Host, Port}, Path, mahi_plus_token, Token)
+                            file_read_fsm:start_link({Host, Port}, Path, token, Token)
                     end,
                     ok = gen_statem:call(Fsm, connect),
                     Fd = S2#state.next_fd,
@@ -593,9 +593,9 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
             lager:debug("~p opening ~p for write (~p)", [S#state.user, Path, Flags]),
             {ok, Fsm} = case S of
                 #state{amode = operator, signer = Signer} ->
-                    file_write_fsm:start_link({Host, Port}, Path, operator, Signer);
+                    file_write_fsm:start_link({Host, Port}, Path, signature, Signer);
                 #state{amode = mahi_plus_token, token = Token} ->
-                    file_write_fsm:start_link({Host, Port}, Path, mahi_plus_token, Token)
+                    file_write_fsm:start_link({Host, Port}, Path, token, Token)
             end,
             ok = gen_statem:call(Fsm, connect),
             Fd = S#state.next_fd,

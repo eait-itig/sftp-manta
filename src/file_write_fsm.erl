@@ -56,7 +56,7 @@ start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
 
 callback_mode() -> [state_functions, state_enter].
 
-request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer, amode = operator}) ->
+request(Verb, Url, Hdrs0, #state{gun = Gun, signer = Signer, amode = signature}) ->
     Req = http_signature:sign(Signer, Verb, Url, Hdrs0),
     #{headers := Hdrs1} = Req,
     Method = case Verb of
@@ -68,7 +68,7 @@ request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer, amode = operato
     end,
     Hdrs2 = maps:to_list(Hdrs1),
     gun:request(Gun, Method, Url, Hdrs2);
-request(Verb, Url, Hdrs0, S = #state{gun = Gun, token = Token, amode = mahi_plus_token}) ->
+request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = token}) ->
     Authz = iolist_to_binary([<<"Token ">>, Token]),
     Hdrs1 = Hdrs0#{<<"authorization">> => Authz},
     Method = case Verb of
@@ -112,13 +112,13 @@ fn_ext_to_mime(Fname) ->
         _ -> <<"application/octet-stream">>
     end.
 
-init([{Host, Port}, Path, operator, Signer]) ->
+init([{Host, Port}, Path, signature, Signer]) ->
     S0 = #state{host = Host, port = Port, path = Path,
-        amode = operator, signer = Signer},
+        amode = signature, signer = Signer},
     {ok, disconnected, S0};
-init([{Host, Port}, Path, mahi_plus_token, Token]) ->
+init([{Host, Port}, Path, token, Token]) ->
     S0 = #state{host = Host, port = Port, path = Path,
-        amode = mahi_plus_token, token = Token},
+        amode = token, token = Token},
     {ok, disconnected, S0}.
 
 disconnected(enter, _, _S) ->
@@ -146,10 +146,10 @@ disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path =
     gen_statem:reply(From, ok),
     {next_state, flowing, S1#state{stream = Stream}}.
 
-flowing(enter, _, S) ->
+flowing(enter, _, #state{}) ->
     keep_state_and_data;
 
-flowing({call, From}, {read, _Len}, S = #state{}) ->
+flowing({call, From}, {read, _Len}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
 
@@ -196,13 +196,13 @@ flowing(info, {gun_error, Gun, Reason}, S = #state{gun = Gun}) ->
 flowing(info, {'DOWN', MRef, process, Gun, Reason}, S = #state{mref = MRef, gun = Gun}) ->
     {next_state, errored, S#state{error = {gun_down, Reason}}};
 
-flowing({call, From}, close, S = #state{gun = Gun, stream = Stream}) ->
+flowing({call, From}, close, #state{gun = Gun, stream = Stream}) ->
     ok = gun:data(Gun, Stream, fin, <<>>),
     case gun:await(Gun, Stream, 30000) of
-        {response, fin, Status, Headers} when (Status < 300) ->
+        {response, fin, Status, _Headers} when (Status < 300) ->
             gen_statem:reply(From, ok),
             {stop, normal};
-        {response, fin, Status, Headers} ->
+        {response, fin, Status, _Headers} ->
             gen_statem:reply(From, {error, {http, Status}}),
             {stop, normal};
         {response, nofin, Status, Headers} when (Status >= 300) ->
@@ -230,10 +230,10 @@ errored({call, From}, {position, _Offset}, #state{error = Err}) ->
 errored({call, From}, {read, _Len}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
-errored({call, From}, {write, _Data}, S = #state{error = Err}) ->
+errored({call, From}, {write, _Data}, #state{error = Err}) ->
     gen_statem:reply(From, {error, Err}),
     keep_state_and_data;
-errored({call, From}, close, S = #state{gun = Gun}) ->
+errored({call, From}, close, #state{gun = Gun}) ->
     gun:flush(Gun),
     gun:close(Gun),
     gen_statem:reply(From, ok),

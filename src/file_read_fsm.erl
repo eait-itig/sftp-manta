@@ -65,7 +65,7 @@ start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
 
 callback_mode() -> [state_functions, state_enter].
 
-request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer, amode = operator}) ->
+request(Verb, Url, Hdrs0, #state{gun = Gun, signer = Signer, amode = signature}) ->
     Req = http_signature:sign(Signer, Verb, Url, Hdrs0),
     #{headers := Hdrs1} = Req,
     Method = case Verb of
@@ -77,7 +77,7 @@ request(Verb, Url, Hdrs0, S = #state{gun = Gun, signer = Signer, amode = operato
     end,
     Hdrs2 = maps:to_list(Hdrs1),
     gun:request(Gun, Method, Url, Hdrs2);
-request(Verb, Url, Hdrs0, S = #state{gun = Gun, token = Token, amode = mahi_plus_token}) ->
+request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = token}) ->
     Authz = iolist_to_binary([<<"Token ">>, Token]),
     Hdrs1 = Hdrs0#{<<"authorization">> => Authz},
     Method = case Verb of
@@ -90,13 +90,13 @@ request(Verb, Url, Hdrs0, S = #state{gun = Gun, token = Token, amode = mahi_plus
     Hdrs2 = maps:to_list(Hdrs1),
     gun:request(Gun, Method, Url, Hdrs2).
 
-init([{Host, Port}, Path, operator, Signer]) ->
+init([{Host, Port}, Path, signature, Signer]) ->
     S0 = #state{host = Host, port = Port, path = Path,
-        amode = operator, signer = Signer},
+        amode = signature, signer = Signer},
     {ok, disconnected, S0};
-init([{Host, Port}, Path, mahi_plus_token, Token]) ->
+init([{Host, Port}, Path, token, Token]) ->
     S0 = #state{host = Host, port = Port, path = Path,
-        amode = mahi_plus_token, token = Token},
+        amode = token, token = Token},
     {ok, disconnected, S0}.
 
 disconnected(enter, _, _S) ->
@@ -130,7 +130,7 @@ disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path =
             {stop, normal}
     end.
 
-ready(enter, _, S) ->
+ready(enter, _, #state{}) ->
     keep_state_and_data;
 ready({call, From}, {position, Offset}, S = #state{rng = true, gun = Gun}) ->
     Pos = case Offset of
@@ -147,12 +147,12 @@ ready({call, From}, {position, Offset}, S = #state{rng = true, gun = Gun}) ->
     S1 = S#state{rpos = Pos, spos = 0, stream = Stream},
     gen_statem:reply(From, {ok, Pos}),
     case gun:await(Gun, Stream, 30000) of
-        {response, fin, Status, Headers} when (Status < 300) ->
+        {response, fin, Status, _Headers} when (Status < 300) ->
             {next_state, ended, S1};
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
             {next_state, flowing, S1#state{hdrs = Hdrs}};
-        {response, _Mode, Status, Headers} ->
+        {response, _Mode, Status, _Headers} ->
             gun:cancel(Gun, Stream),
             gun:flush(Gun),
             {next_state, errored, S1#state{error = {http, Status}}}
@@ -167,7 +167,7 @@ ready({call, From}, {position, Offset}, S = #state{rng = false, gun = Gun}) ->
     Stream = request(get, S#state.path, #{}, S),
     S1 = S#state{rpos = Pos, spos = 0, waiter = From, stream = Stream},
     case gun:await(Gun, Stream, 30000) of
-        {response, fin, Status, Headers} when (Status < 300) ->
+        {response, fin, Status, _Headers} when (Status < 300) ->
             gen_statem:reply(From, {ok, Pos}),
             {next_state, ended, S1};
         {response, nofin, Status, Headers} when (Status < 300) ->
@@ -181,7 +181,7 @@ ready({call, From}, {position, Offset}, S = #state{rng = false, gun = Gun}) ->
                     lager:debug("skipping ahead to ~p", [Pos]),
                     {next_state, skipping, S2}
             end;
-        {response, _Mode, Status, Headers} ->
+        {response, _Mode, Status, _Headers} ->
             gun:cancel(Gun, Stream),
             gun:flush(Gun),
             gen_statem:reply(From, {ok, Pos}),
@@ -191,20 +191,20 @@ ready({call, From}, {read, Len}, S = #state{gun = Gun}) ->
     Stream = request(get, S#state.path, #{}, S),
     S1 = S#state{rpos = 0, spos = 0, reader = {From, Len}, stream = Stream},
     case gun:await(Gun, Stream, 30000) of
-        {response, fin, Status, Headers} when (Status < 300) ->
+        {response, fin, Status, _Headers} when (Status < 300) ->
             {next_state, ended, S1};
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
             {next_state, flowing, S1#state{hdrs = Hdrs}};
-        {response, _Mode, Status, Headers} ->
+        {response, _Mode, Status, _Headers} ->
             gun:cancel(Gun, Stream),
             gun:flush(Gun),
             {next_state, errored, S1#state{error = {http, Status}}}
     end;
-ready({call, From}, {write, _Data}, S = #state{}) ->
+ready({call, From}, {write, _Data}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
-ready({call, From}, close, S = #state{gun = Gun}) ->
+ready({call, From}, close, #state{gun = Gun}) ->
     gun:flush(Gun),
     gun:close(Gun),
     gen_statem:reply(From, ok),
@@ -218,7 +218,7 @@ ended(enter, _, S = #state{reader = {From, Len}, buf = Buf, ackref = none}) ->
     gen_statem:reply(From, {ok, Chunk}),
     S1 = S#state{buf = NewBuf, rpos = S#state.rpos + RealLen},
     {keep_state, S1};
-ended(enter, _, S = #state{ackref = none}) ->
+ended(enter, _, #state{ackref = none}) ->
     keep_state_and_data;
 ended(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
     Gun ! {gun_data_ack, self(), Stream, AckRef},
@@ -246,20 +246,20 @@ ended({call, From}, {read, Len}, S = #state{buf = Buf}) when (size(Buf) > 0) ->
     gen_statem:reply(From, {ok, Chunk}),
     S1 = S#state{buf = NewBuf, rpos = S#state.rpos + RealLen},
     {next_state, ended, S1};
-ended({call, From}, {read, Len}, S = #state{}) ->
+ended({call, From}, {read, _Len}, S = #state{}) ->
     gen_statem:reply(From, eof),
     {next_state, ended, S};
-ended({call, From}, {write, _Data}, S = #state{}) ->
+ended({call, From}, {write, _Data}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
-ended({call, From}, close, S = #state{gun = Gun}) ->
+ended({call, From}, close, #state{gun = Gun}) ->
     gun:flush(Gun),
     gun:close(Gun),
     gen_statem:reply(From, ok),
     {stop, normal};
-ended(info, {gun_error, Gun, Stream, Reason}, S = #state{gun = Gun, stream = Stream}) ->
+ended(info, {gun_error, Gun, Stream, _Why}, #state{gun = Gun, stream = Stream}) ->
     keep_state_and_data;
-ended(info, {gun_error, Gun, Reason}, S = #state{gun = Gun}) ->
+ended(info, {gun_error, Gun, _Why}, #state{gun = Gun}) ->
     keep_state_and_data.
 
 errored(enter, _, S = #state{error = Err, waiter = Waiter, reader = Reader}) ->
@@ -269,7 +269,7 @@ errored(enter, _, S = #state{error = Err, waiter = Waiter, reader = Reader}) ->
     end,
     case Reader of
         none -> ok;
-        {From, Len} -> gen_statem:reply(From, {error, Err})
+        {From, _Len} -> gen_statem:reply(From, {error, Err})
     end,
     {keep_state, S#state{waiter = none, reader = none}};
 errored({call, From}, {position, _Offset}, #state{error = Err}) ->
@@ -278,10 +278,10 @@ errored({call, From}, {position, _Offset}, #state{error = Err}) ->
 errored({call, From}, {read, _Len}, #state{error = Err}) ->
     gen_statem:reply(From, {error, Err}),
     keep_state_and_data;
-errored({call, From}, {write, _Data}, S = #state{}) ->
+errored({call, From}, {write, _Data}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
-errored({call, From}, close, S = #state{gun = Gun}) ->
+errored({call, From}, close, #state{gun = Gun}) ->
     gun:flush(Gun),
     gun:close(Gun),
     gen_statem:reply(From, ok),
@@ -296,18 +296,18 @@ maybe_reply_reader(S = #state{reader = {From, Len}, buf = Buf}) when (size(Buf) 
 maybe_reply_reader(S = #state{}) -> S.
 
 
-skipping(enter, _, S = #state{ackref = none}) ->
+skipping(enter, _, #state{ackref = none}) ->
     keep_state_and_data;
 skipping(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
     Gun ! {gun_data_ack, self(), Stream, AckRef},
     {keep_state, S#state{ackref = none}};
-skipping({call, From}, {read, Len}, S = #state{buf = Buf}) ->
+skipping({call, From}, {read, Len}, S = #state{}) ->
     {next_state, skipping, S#state{reader = {From, Len}}};
-skipping({call, From}, {write, _Data}, S = #state{}) ->
+skipping({call, From}, {write, _Data}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
 skipping(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
-    #state{buf = Buf0, spos = SPos, rpos = RPos} = S,
+    #state{spos = SPos, rpos = RPos} = S,
     SPos2 = SPos + size(Data),
     if
         (SPos2 > RPos) ->
@@ -328,7 +328,7 @@ skipping(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gu
             {repeat_state, S#state{spos = SPos2, ackref = AckRef}}
     end;
 skipping(info, {gun_data, Gun, Stream, fin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
-    #state{buf = Buf0, spos = SPos, rpos = RPos} = S,
+    #state{spos = SPos, rpos = RPos} = S,
     SPos2 = SPos + size(Data),
     S1 = case S of
         #state{waiter = none} -> S;
@@ -365,7 +365,7 @@ skipping({call, From}, close, S = #state{gun = Gun, stream = Stream}) ->
     gen_statem:reply(From, ok),
     {stop, normal}.
 
-flowing(enter, _, S = #state{ackref = none}) ->
+flowing(enter, _, #state{ackref = none}) ->
     keep_state_and_data;
 flowing(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
     Gun ! {gun_data_ack, self(), Stream, AckRef},
@@ -377,9 +377,9 @@ flowing({call, From}, {read, Len}, S = #state{buf = Buf}) when (size(Buf) >= Len
     Pos = S#state.rpos + Len,
     S1 = S#state{buf = NewBuf, reader = none, rpos = Pos},
     {next_state, flowing, S1};
-flowing({call, From}, {read, Len}, S = #state{buf = Buf}) ->
+flowing({call, From}, {read, Len}, S = #state{}) ->
     {next_state, flowing, S#state{reader = {From, Len}}};
-flowing({call, From}, {write, _Data}, S = #state{}) ->
+flowing({call, From}, {write, _Data}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
 
@@ -401,7 +401,7 @@ flowing({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) 
             Buf1 = S#state.buf,
             ToDrop = RPos2 - RPos,
             <<_Dropped:ToDrop/binary, Buf2/binary>> = Buf1,
-            S1 = S#state{rpos = RPos2, buf = Buf1},
+            S1 = S#state{rpos = RPos2, buf = Buf2},
             gen_statem:reply(From, {ok, RPos2}),
             {next_state, flowing, S1};
         true ->
@@ -449,19 +449,19 @@ flowing({call, From}, close, S = #state{gun = Gun, stream = Stream}) ->
     gen_statem:reply(From, ok),
     {stop, normal}.
 
-corked(enter, _, S) ->
+corked(enter, _, #state{}) ->
     keep_state_and_data;
 
 corked({call, From}, {read, Len}, S = #state{buf = Buf}) when (size(Buf) >= Len) ->
     <<Chunk:Len/binary, NewBuf/binary>> = Buf,
     gen_statem:reply(From, {ok, Chunk}),
     {next_state, flowing, S#state{buf = NewBuf, reader = none}};
-corked({call, From}, {read, Len}, S = #state{buf = Buf}) ->
+corked({call, From}, {read, Len}, S = #state{}) ->
     {next_state, flowing, S#state{reader = {From, Len}}};
 
-corked({call, From}, {position, Offset}, S = #state{}) ->
+corked({call, _From}, {position, _Offset}, S = #state{}) ->
     {next_state, flowing, S, postpone};
-corked({call, From}, {write, _Data}, S = #state{}) ->
+corked({call, From}, {write, _Data}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
 
