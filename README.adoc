@@ -1,0 +1,10 @@
+:toc: left
+:source-highlighter: pygments
+:doctype: book
+:idprefix:
+:docinfo:
+
+# sftp-manta
+
+An SFTP server that bridges to the Manta object storage service (so you can
+access Manta with an SFTP client).
