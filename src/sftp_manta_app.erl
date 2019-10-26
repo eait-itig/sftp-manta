@@ -321,7 +321,7 @@ headers_to_file_info(Path, Hdrs) ->
         _ ->
             FInfo0#file_info{type = regular}
     end,
-    FInfo2 = case string:split(Path, "/") of
+    FInfo2 = case binary:split(Path, [<<"/">>], [global]) of
         [<<"">>, _User, <<"public">> | _Rest] when FInfo1#file_info.type =:= directory ->
             FInfo1#file_info{mode = 8#775 bor ?S_IFDIR};
         [<<"">>, _User, <<"public">> | _Rest] ->
@@ -371,7 +371,7 @@ lsobj_to_file_info(Path, LsObj) ->
         <<"directory">> -> FInfo0#file_info{type = directory, size = 0};
         <<"object">> -> FInfo0#file_info{type = regular}
     end,
-    FInfo2 = case string:split(Path, "/") of
+    FInfo2 = case binary:split(Path, [<<"/">>], [global]) of
         [<<"">>, _User, <<"public">> | _Rest] when FInfo1#file_info.type =:= directory ->
             FInfo1#file_info{mode = 8#775 bor ?S_IFDIR};
         [<<"">>, _User, <<"public">> | _Rest] ->
@@ -391,14 +391,19 @@ lsobj_to_file_info(Path, LsObj) ->
     end,
     FInfo3.
 
-fake_new_file_info(_Path) ->
+fake_new_file_info(Path) when is_list(Path) ->
+    fake_new_file_info(unicode:characters_to_binary(Path, utf8));
+fake_new_file_info(Path) ->
     #file_info{
         size = 0,
         uid = 0, gid = 0,
         mtime = calendar:local_time(),
         atime = calendar:local_time(),
         type = regular,
-        mode = 8#664 bor ?S_IFREG
+        mode = case binary:split(Path, [<<"/">>], [global]) of
+            [<<"">>, _User, <<"public">> | _Rest] -> 8#664 bor ?S_IFREG;
+            _ -> 8#660 bor ?S_IFREG
+        end
     }.
 
 get_stat(Path, S = #state{}) when is_list(Path) ->

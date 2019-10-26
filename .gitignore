@@ -1,0 +1,6 @@
+log/
+_build/
+config/sys.config
+config/vm.args
+config/authkey*
+config/hostkey*
