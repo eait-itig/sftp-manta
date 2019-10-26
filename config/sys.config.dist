@@ -1,37 +1,79 @@
 [
 	{sftp_manta, [
+		%%
+		%% Basic settings
+		%%
+
+		%% Port to listen for SFTP connections on
 		{listen_port, 2222},
+
+		%% SSH host key (must be ECDSA at the moment)
 		{host_key_file, "config/hostkey_ecdsa"},
 
+		%% Details for the Manta we want to connect to
 		{manta, [
-			{host, "stluc.manta.uqcloud.net"},
+			{host, "manta.example.com"},
 			{port, 443}
 		]},
 
+		%%
+		%% Authentication
+		%%
+
+		%%
+		%% If you want to deploy the bridge against a manta you don't
+		%% control, or a minimanta installation, you proably want
+		%% the "operator" auth mode.
+		%%
+		%% In "operator" mode, no matter which user connects to the
+		%% bridge, we auth to Manta with http-signature and a single
+		%% auth private key. Keys allowed for auth to the bridge
+		%% can be listed in authorized_keys_file (use attribute
+		%% user=blah to restrict them to a particular user)
+		%%
 		%{auth_mode, operator},
 		%{auth_key_file, "config/authkey_ecdsa"},
-		%{auth_operator, "xlex"},
+		%{auth_operator, "admin"},
+		%{authorized_keys_file, "config/authorized_keys"},
 
-		{auth_mode, mahi_plus_token},
-		{token_auth, [
-			{key, 16#1234},
-			{iv, 16#1234}
-		]},
-		{mahi, [
-			{host, "localhost"},
-			{port, 8080}
-		]},
+		%%
+		%% If you control the Manta being bridged this is probably the
+		%% best option: auth_mode "mahi_plus_token" uses Mahi to look
+		%% up users who are connecting to the bridge and auth their
+		%% public keys. Then, we impersonate them to Manta using
+		%% muskie token authentication.
+		%%
+		%{auth_mode, mahi_plus_token},
+		%{token_auth, [
+		%	%% sdc-sapi /services?name=webapi
+		%	%% MUSKIE_JOB_TOKEN_AES_KEY
+		%	{key, 16#1234},
+		%	%% MUSKIE_JOB_TOKEN_AES_IV
+		%	{iv, 16#1234}
+		%]},
+		%{mahi, [
+		%	{host, "localhost"},
+		%	{port, 8080}
+		%]},
 
-		{krb5, [
-			{realm, "KRB5.UQ.EDU.AU"},
-			%{kdc, ["kdc1.domain"]},
-			%{ciphers, [aes256_hmac_sha1, aes128_hmac_sha1, rc4_hmac]},
-			{timeout, 2000}
-		]}
+		%%
+		%% If you want password auth support (it's optional), we can
+		%% check passwords against a KRB5 realm.
+		%%
+		%{krb5, [
+		%	{realm, "KRB5.EXAMPLE.COM"},
+		%	%{kdc, ["kdc1.domain"]},
+		%	%{ciphers, [aes256_hmac_sha1, aes128_hmac_sha1, rc4_hmac]},
+		%	{timeout, 2000}
+		%]}
 	]},
 	{lager, [
+		{log_root, "/var/log/sftp_manta"},
 		{handlers, [
-			{lager_console_backend, [{level, debug}]}
+			{lager_console_backend, [{level, info}]},
+			{lager_file_backend, [{file, "error.log"}, {level, error}]},
+			{lager_file_backend, [{file, "debug.log"}, {level, debug}]},
+			{lager_file_backend, [{file, "console.log"}, {level, info}]}
 		]}
 	]}
 ].
