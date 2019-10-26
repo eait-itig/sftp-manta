@@ -2,6 +2,7 @@
 %% %CopyrightBegin%
 %%
 %% Copyright Ericsson AB 2005-2018. All Rights Reserved.
+%% Copyright The University of Queensland 2019
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,6 +22,7 @@
 %%
 
 %%% Description: SFTP server daemon
+%% Modified for sftp v3 and login/logout callbacks
 
 -module(sftpd_manta).
 

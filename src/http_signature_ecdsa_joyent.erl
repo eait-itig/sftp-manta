@@ -2,11 +2,14 @@
 %% vim: ts=4 sw=4 ft=erlang noet
 %%%-------------------------------------------------------------------
 %%% @author Andrew Bennett <andrew@pixid.com>
+%%% @author Alex Wilson <alex@uq.edu.au>
 %%% @copyright 2014-2017, Andrew Bennett
+%%% @copyright 2019, The University of Queensland
 %%% @doc
 %%%
 %%% @end
 %%% Created :  06 Oct 2017 by Andrew Bennett <andrew@pixid.com>
+%%% Modified to use the Joyent variant of ECDSA signatures
 %%%-------------------------------------------------------------------
 -module(http_signature_ecdsa_joyent).
 -behaviour(http_signature_algorithm).
