@@ -49,7 +49,7 @@ start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
     token,
     stream,
     error,
-    waiter,
+    waiter = none,
     mref,
     wpos = 0
     }).
@@ -175,13 +175,9 @@ flowing({call, From}, {position, Offset}, S = #state{wpos = WPos}) ->
         (WPos2 == WPos) ->
             gen_statem:reply(From, {ok, WPos2}),
             {next_state, flowing, S};
-        (WPos2 > WPos) ->
-            #state{gun = Gun, stream = Stream} = S,
-            Zeros = WPos2 - WPos,
-            ok = gun:data(Gun, Stream, nofin, <<0:Zeros/unit:8>>),
-            gen_statem:reply(From, {ok, WPos2}),
-            {next_state, flowing, S#state{wpos = WPos2}};
         true ->
+            lager:warning("write_fsm for ~p tried to rewind/skip from ~p to "
+                "~p", [S#state.path, WPos, WPos2]),
             #state{gun = Gun, stream = Stream} = S,
             gun:cancel(Gun, Stream),
             gun:flush(Gun),
