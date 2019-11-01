@@ -144,17 +144,34 @@ ready({call, From}, {position, Offset}, S = #state{rng = true, gun = Gun}) ->
     RangeHeader = <<"bytes=", PosBin/binary, "-", LenBin/binary>>,
     InHdrs = #{<<"range">> => RangeHeader},
     Stream = request(get, S#state.path, InHdrs, S),
-    S1 = S#state{rpos = Pos, spos = 0, stream = Stream},
+    S1 = S#state{buf = <<>>, rpos = Pos, spos = Pos, stream = Stream},
     gen_statem:reply(From, {ok, Pos}),
     case gun:await(Gun, Stream, 30000) of
         {response, fin, Status, _Headers} when (Status < 300) ->
             {next_state, ended, S1};
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
+            if
+                (Pos > 0) -> lager:debug("using range req to skip to ~p", [Pos]);
+                true -> ok
+            end,
             {next_state, flowing, S1#state{hdrs = Hdrs}};
-        {response, _Mode, Status, _Headers} ->
-            gun:cancel(Gun, Stream),
-            gun:flush(Gun),
+        {response, nofin, Status, Headers} ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            ErrInfo = case ContentType of
+                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                _ -> {http, Status, Body}
+            end,
+            case ErrInfo of
+                {http, 416, #{<<"code">> := <<"RequestedRangeNotSatisfiableError">>}} ->
+                    {next_state, ended, S1};
+                _ ->
+                    lager:debug("getobject returned ~p", [ErrInfo]),
+                    {next_state, errored, S1#state{error = ErrInfo}}
+            end;
+        {response, fin, Status, _Headers} ->
             {next_state, errored, S1#state{error = {http, Status}}}
     end;
 ready({call, From}, {position, Offset}, S = #state{rng = false, gun = Gun}) ->
@@ -165,7 +182,7 @@ ready({call, From}, {position, Offset}, S = #state{rng = false, gun = Gun}) ->
         cur -> 0
     end,
     Stream = request(get, S#state.path, #{}, S),
-    S1 = S#state{rpos = Pos, spos = 0, waiter = From, stream = Stream},
+    S1 = S#state{buf = <<>>, rpos = Pos, spos = 0, waiter = From, stream = Stream},
     case gun:await(Gun, Stream, 30000) of
         {response, fin, Status, _Headers} when (Status < 300) ->
             gen_statem:reply(From, {ok, Pos}),
@@ -181,24 +198,47 @@ ready({call, From}, {position, Offset}, S = #state{rng = false, gun = Gun}) ->
                     lager:debug("skipping ahead to ~p", [Pos]),
                     {next_state, skipping, S2}
             end;
-        {response, _Mode, Status, _Headers} ->
-            gun:cancel(Gun, Stream),
-            gun:flush(Gun),
+        {response, nofin, Status, Headers} ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            ErrInfo = case ContentType of
+                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                _ -> {http, Status, Body}
+            end,
+            gen_statem:reply(From, {ok, Pos}),
+            case ErrInfo of
+                _ ->
+                    lager:debug("getobject returned ~p", [ErrInfo]),
+                    {next_state, errored, S1#state{error = ErrInfo}}
+            end;
+        {response, fin, Status, _Headers} ->
             gen_statem:reply(From, {ok, Pos}),
             {next_state, errored, S1#state{error = {http, Status}}}
     end;
 ready({call, From}, {read, Len}, S = #state{gun = Gun}) ->
     Stream = request(get, S#state.path, #{}, S),
-    S1 = S#state{rpos = 0, spos = 0, reader = {From, Len}, stream = Stream},
+    S1 = S#state{buf = <<>>, rpos = 0, spos = 0, reader = {From, Len}, stream = Stream},
     case gun:await(Gun, Stream, 30000) of
         {response, fin, Status, _Headers} when (Status < 300) ->
             {next_state, ended, S1};
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
             {next_state, flowing, S1#state{hdrs = Hdrs}};
-        {response, _Mode, Status, _Headers} ->
-            gun:cancel(Gun, Stream),
-            gun:flush(Gun),
+        {response, nofin, Status, Headers} ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            ErrInfo = case ContentType of
+                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                _ -> {http, Status, Body}
+            end,
+            case ErrInfo of
+                _ ->
+                    lager:debug("getobject returned ~p", [ErrInfo]),
+                    {next_state, errored, S1#state{error = ErrInfo}}
+            end;
+        {response, fin, Status, _Headers} ->
             {next_state, errored, S1#state{error = {http, Status}}}
     end;
 ready({call, From}, {write, _Data}, #state{}) ->
@@ -216,7 +256,7 @@ ended(enter, _, S = #state{reader = {From, Len}, buf = Buf, ackref = none}) ->
     RealLen = if (Len > size(Buf)) -> size(Buf); true -> Len end,
     <<Chunk:RealLen/binary, NewBuf/binary>> = Buf,
     gen_statem:reply(From, {ok, Chunk}),
-    S1 = S#state{buf = NewBuf, rpos = S#state.rpos + RealLen},
+    S1 = S#state{buf = NewBuf, rpos = S#state.rpos + RealLen, reader = none},
     {keep_state, S1};
 ended(enter, _, #state{ackref = none}) ->
     keep_state_and_data;
@@ -226,7 +266,7 @@ ended(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
 ended({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) ->
     RPos2 = case Offset of
         {bof, V} -> V;
-        {cur, V} -> V;
+        {cur, V} -> RPos + V;
         bof -> 0;
         cur -> RPos
     end,
@@ -238,6 +278,7 @@ ended({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) ->
             gen_statem:reply(From, {ok, RPos2}),
             {keep_state, S#state{rpos = RPos2}};
         true ->
+            lager:debug("ended stream restarting, asked to seek to ~p", [RPos2]),
             {next_state, ready, S, postpone}
     end;
 ended({call, From}, {read, Len}, S = #state{buf = Buf}) when (size(Buf) > 0) ->
@@ -396,6 +437,7 @@ flowing({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) 
             {next_state, flowing, S};
         (RPos2 > SPos) ->
             S1 = S#state{buf = <<>>, rpos = RPos2, waiter = From},
+            lager:debug("skipping ahead to ~p (at ~p)", [RPos2, RPos]),
             {next_state, skipping, S1};
         (RPos2 > RPos) ->
             Buf1 = S#state.buf,
@@ -403,8 +445,11 @@ flowing({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) 
             <<_Dropped:ToDrop/binary, Buf2/binary>> = Buf1,
             S1 = S#state{rpos = RPos2, buf = Buf2},
             gen_statem:reply(From, {ok, RPos2}),
+            lager:debug("dropping ~p bytes to reach ~p (was at ~p)", [ToDrop,
+                RPos2, RPos]),
             {next_state, flowing, S1};
         true ->
+            lager:debug("seeking backwards to ~p from ~p", [RPos2, RPos]),
             #state{gun = Gun, stream = Stream} = S,
             gun:cancel(Gun, Stream),
             gun:flush(Gun),
@@ -455,7 +500,12 @@ corked(enter, _, #state{}) ->
 corked({call, From}, {read, Len}, S = #state{buf = Buf}) when (size(Buf) >= Len) ->
     <<Chunk:Len/binary, NewBuf/binary>> = Buf,
     gen_statem:reply(From, {ok, Chunk}),
-    {next_state, flowing, S#state{buf = NewBuf, reader = none}};
+    Pos = S#state.rpos + Len,
+    S2 = S#state{buf = NewBuf, rpos = Pos, reader = none},
+    if
+        (size(NewBuf) > ?BUF_MAX) -> {repeat_state, S2};
+        true -> {next_state, flowing, S2}
+    end;
 corked({call, From}, {read, Len}, S = #state{}) ->
     {next_state, flowing, S#state{reader = {From, Len}}};
 
