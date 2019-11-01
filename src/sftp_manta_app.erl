@@ -175,6 +175,13 @@ validate_pw(User, Pw, _RemoteAddr, _State) ->
     peer
     }).
 
+path_to_uri(Path) when is_list(Path) ->
+    path_to_uri(unicode:characters_to_binary(Path, utf8));
+path_to_uri(Path) when is_binary(Path) ->
+    Dirs = binary:split(Path, [<<"/">>], [global]),
+    DirEncs = [cow_uri:urlencode(C) || C <- Dirs],
+    iolist_to_binary(lists:join("/", DirEncs)).
+
 request(Verb, Url, Hdrs0, #state{gun = Gun, signer = Signer, amode = operator}) ->
     Req = http_signature:sign(Signer, Verb, Url, Hdrs0),
     #{headers := Hdrs1} = Req,
@@ -417,7 +424,7 @@ get_stat(Path, S = #state{statcache = Cache, gun = Gun}) ->
         #{Path := #{ts := When, error := Why}} when (When > Limit) ->
             {error, Why, S};
         _ ->
-            Stream = request(head, Path, #{}, S),
+            Stream = request(head, path_to_uri(Path), #{}, S),
             case gun:await(Gun, Stream, 15000) of
                 {response, fin, Status, Headers} when (Status < 300) ->
                     Hdrs = maps:from_list(Headers),
@@ -453,7 +460,7 @@ list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
     InHdrs = #{
         <<"accept">> => <<"application/json; type=directory">>
     },
-    Stream = request(get, AbsPath, InHdrs, S),
+    Stream = request(get, path_to_uri(AbsPath), InHdrs, S),
     case gun:await(Gun, Stream, 30000) of
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
@@ -508,7 +515,7 @@ read_link_info(Path, S = #state{}) ->
     end.
 
 delete(Path, S = #state{gun = Gun}) ->
-    Stream = request(delete, Path, #{}, S),
+    Stream = request(delete, path_to_uri(Path), #{}, S),
     case gun:await(Gun, Stream, 30000) of
         {response, fin, Status, _Headers} when (Status < 300) ->
             #state{statcache = Cache} = S,
@@ -553,14 +560,14 @@ make_dir(Path, S = #state{gun = Gun}) ->
                 <<"content-type">> => <<"application/json; type=directory">>,
                 <<"content-length">> => <<"0">>
             },
-            Stream = request(put, Path, InHdrs, S),
+            Stream = request(put, path_to_uri(Path), InHdrs, S2),
             case gun:await(Gun, Stream, 30000) of
                 {response, fin, Status, _Headers} when (Status < 300) ->
-                    #state{statcache = Cache} = S,
+                    #state{statcache = Cache} = S2,
                     PathBin = unicode:characters_to_binary(Path, utf8),
                     Cache2 = Cache#{ PathBin => #{ ts => 0, error => enoent } },
-                    S2 = S#state{statcache = Cache2},
-                    {ok, S2};
+                    S3 = S2#state{statcache = Cache2},
+                    {ok, S3};
                 {response, fin, Status, _Headers} ->
                     {{error, {http, Status}}, S};
                 {response, nofin, Status, Headers} when (Status > 300) ->
@@ -574,7 +581,7 @@ make_dir(Path, S = #state{gun = Gun}) ->
                     case ErrInfo of
                         _ ->
                             lager:debug("mkdir returned ~p", [ErrInfo]),
-                            {{error, ErrInfo}, S}
+                            {{error, ErrInfo}, S2}
                     end
             end
     end.
@@ -592,9 +599,9 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
                     lager:debug("~p opening ~p for read", [S#state.user, Path]),
                     {ok, Fsm} = case S2 of
                         #state{amode = operator, signer = Signer} ->
-                            file_read_fsm:start_link({Host, Port}, Path, signature, Signer);
+                            file_read_fsm:start_link({Host, Port}, path_to_uri(Path), signature, Signer);
                         #state{amode = mahi_plus_token, token = Token} ->
-                            file_read_fsm:start_link({Host, Port}, Path, token, Token)
+                            file_read_fsm:start_link({Host, Port}, path_to_uri(Path), token, Token)
                     end,
                     ok = gen_statem:call(Fsm, connect),
                     Fd = S2#state.next_fd,
@@ -612,9 +619,9 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
             lager:debug("~p opening ~p for write (~p)", [S#state.user, Path, Flags]),
             {ok, Fsm} = case S of
                 #state{amode = operator, signer = Signer} ->
-                    file_write_fsm:start_link({Host, Port}, Path, signature, Signer);
+                    file_write_fsm:start_link({Host, Port}, path_to_uri(Path), signature, Signer);
                 #state{amode = mahi_plus_token, token = Token} ->
-                    file_write_fsm:start_link({Host, Port}, Path, token, Token)
+                    file_write_fsm:start_link({Host, Port}, path_to_uri(Path), token, Token)
             end,
             ok = gen_statem:call(Fsm, connect),
             Fd = S#state.next_fd,
@@ -677,7 +684,7 @@ rename(Path, Path2, S = #state{gun = Gun}) ->
         <<"content-length">> => <<"0">>,
         <<"location">> => unicode:characters_to_binary(Path, utf8)
     },
-    Stream = request(put, Path2, InHdrs, S),
+    Stream = request(put, path_to_uri(Path2), InHdrs, S),
     case gun:await(Gun, Stream, 30000) of
         {response, fin, Status, _Headers} when (Status < 300) ->
             #state{statcache = Cache} = S,
