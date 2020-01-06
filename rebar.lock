@@ -6,7 +6,7 @@
  {<<"jsx">>,{pkg,<<"jsx">>,<<"2.10.0">>},0},
  {<<"kerlberos">>,
   {git,"https://github.com/arekinath/kerlberos",
-       {ref,"0d45713961111b2284a9b632839729e99312f0d5"}},
+       {ref,"6ade3be3a3a9c94d7cb26c0574f8854c6bdfbbd6"}},
   0},
  {<<"lager">>,{pkg,<<"lager">>,<<"3.8.0">>},0},
  {<<"neotoma">>,
