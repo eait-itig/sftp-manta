@@ -60,7 +60,7 @@ init([]) ->
         {pwdfun, fun sftp_manta_app:validate_pw/4},
         {key_cb, {sftp_manta_app, []}},
         {preferred_algorithms, [
-            {public_key, ['ecdsa-sha2-nistp256']}
+            {public_key, ['ecdsa-sha2-nistp256', 'rsa-sha2-512', 'rsa-sha2-256', 'ssh-rsa']}
         ]},
 	{recbuf, 128*1024},
 	{sndbuf, 128*1024},

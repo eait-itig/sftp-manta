@@ -49,6 +49,14 @@ start(_StartType, _StartArgs) ->
 stop(_State) ->
     ok.
 
+host_key('ssh-rsa', _Opts) ->
+    {ok, KeyPath} = application:get_env(sftp_manta, rsa_host_key_file),
+    {ok, Pem} = file:read_file(KeyPath),
+    [KeyEntry] = public_key:pem_decode(Pem),
+    Key = #'RSAPrivateKey'{} = public_key:pem_entry_decode(KeyEntry),
+    {ok, Key};
+host_key('rsa-sha2-256', Opts) -> host_key('ssh-rsa', Opts);
+host_key('rsa-sha2-512', Opts) -> host_key('ssh-rsa', Opts);
 host_key('ecdsa-sha2-nistp256', _Opts) ->
     {ok, KeyPath} = application:get_env(sftp_manta, host_key_file),
     {ok, Pem} = file:read_file(KeyPath),
@@ -244,7 +252,11 @@ login(User, S = #state{amode = mahi_plus_token}) ->
             {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
             #{<<"account">> := Account, <<"roles">> := Roles} =
                 jsx:decode(Body, [return_maps]),
-            #{<<"uuid">> := Uuid, <<"defaultRoles">> := DefaultRoles} = Account,
+            #{<<"uuid">> := Uuid} = Account,
+            DefaultRoles = case Account of
+                #{<<"defaultRoles">> := D} -> D;
+                _ -> []
+            end,
             TokenJson = jsx:encode(#{
                 <<"v">> => 2,
                 <<"p">> => #{
