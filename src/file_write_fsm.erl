@@ -192,7 +192,7 @@ flowing({call, From}, {write, Data}, S = #state{gun = Gun, stream = Stream, wpos
     end,
     ok = gun:data(Gun, Stream, nofin, Data),
     gen_statem:reply(From, ok),
-    {next_state, flowing, S#state{wpos = WPos2}};
+    {next_state, flowing, S#state{wpos = WPos2}, [hibernate]};
 
 flowing({call, From}, {position, Offset}, S = #state{wpos = WPos}) ->
     WPos2 = case Offset of

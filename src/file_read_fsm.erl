@@ -58,10 +58,32 @@ start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
     ackref = none,
     rpos = 0,
     spos = 0,
-    buf = <<>>
+    buf = [],
+    blen = 0
     }).
 
 -define(BUF_MAX, 128*1024).
+
+append_buf(Data, S = #state{buf = B0, blen = BL0}) ->
+    S#state{buf = B0 ++ [Data], blen = BL0 + byte_size(Data)}.
+take_buf(0, S = #state{}) ->
+    {<<>>, S};
+take_buf(_N, S = #state{buf = [], blen = 0}) ->
+    {<<>>, S};
+take_buf(Len, S = #state{buf = [Chunk0 | B1], blen = BL0}) ->
+    if
+        (Len < byte_size(Chunk0)) ->
+            Data = binary_part(Chunk0, 0, Len),
+            Chunk1 = binary_part(Chunk0, Len, byte_size(Chunk0) - Len),
+            {Data, S#state{buf = [Chunk1 | B1], blen = BL0 - Len}};
+        (Len == byte_size(Chunk0)) ->
+            {Chunk0, S#state{buf = B1, blen = BL0 - Len}};
+        true ->
+            Take = byte_size(Chunk0),
+            S1 = S#state{buf = B1, blen = BL0 - Take},
+            {Rest, S2} = take_buf(Len - Take, S1),
+            {<<Chunk0/binary, Rest/binary>>, S2}
+    end.
 
 callback_mode() -> [state_functions, state_enter].
 
@@ -144,7 +166,7 @@ ready({call, From}, {position, Offset}, S = #state{rng = true, gun = Gun}) ->
     RangeHeader = <<"bytes=", PosBin/binary, "-", LenBin/binary>>,
     InHdrs = #{<<"range">> => RangeHeader},
     Stream = request(get, S#state.path, InHdrs, S),
-    S1 = S#state{buf = <<>>, rpos = Pos, spos = Pos, stream = Stream},
+    S1 = S#state{buf = [], blen = 0, rpos = Pos, spos = Pos, stream = Stream},
     gen_statem:reply(From, {ok, Pos}),
     case gun:await(Gun, Stream, 30000) of
         {response, fin, Status, _Headers} when (Status < 300) ->
@@ -182,7 +204,7 @@ ready({call, From}, {position, Offset}, S = #state{rng = false, gun = Gun}) ->
         cur -> 0
     end,
     Stream = request(get, S#state.path, #{}, S),
-    S1 = S#state{buf = <<>>, rpos = Pos, spos = 0, waiter = From, stream = Stream},
+    S1 = S#state{buf = [], blen = 0, rpos = Pos, spos = 0, waiter = From, stream = Stream},
     case gun:await(Gun, Stream, 30000) of
         {response, fin, Status, _Headers} when (Status < 300) ->
             gen_statem:reply(From, {ok, Pos}),
@@ -218,7 +240,7 @@ ready({call, From}, {position, Offset}, S = #state{rng = false, gun = Gun}) ->
     end;
 ready({call, From}, {read, Len}, S = #state{gun = Gun}) ->
     Stream = request(get, S#state.path, #{}, S),
-    S1 = S#state{buf = <<>>, rpos = 0, spos = 0, reader = {From, Len}, stream = Stream},
+    S1 = S#state{buf = [], blen = 0, rpos = 0, spos = 0, reader = {From, Len}, stream = Stream},
     case gun:await(Gun, Stream, 30000) of
         {response, fin, Status, _Headers} when (Status < 300) ->
             {next_state, ended, S1};
@@ -252,12 +274,12 @@ ready({call, From}, close, #state{gun = Gun}) ->
 ready(info, {'DOWN', MRef, process, Gun, Reason}, S = #state{mref = MRef, gun = Gun}) ->
     {next_state, errored, S#state{error = {gun_down, Reason}}}.
 
-ended(enter, _, S = #state{reader = {From, Len}, buf = Buf, ackref = none}) ->
-    RealLen = if (Len > size(Buf)) -> size(Buf); true -> Len end,
-    <<Chunk:RealLen/binary, NewBuf/binary>> = Buf,
+ended(enter, _, S = #state{reader = {From, Len}, blen = BL, ackref = none}) ->
+    RealLen = if (Len > BL) -> BL; true -> Len end,
+    {Chunk, S1} = take_buf(RealLen, S),
     gen_statem:reply(From, {ok, Chunk}),
-    S1 = S#state{buf = NewBuf, rpos = S#state.rpos + RealLen, reader = none},
-    {keep_state, S1};
+    S2 = S1#state{rpos = S#state.rpos + RealLen, reader = none},
+    {keep_state, S2};
 ended(enter, _, #state{ackref = none}) ->
     keep_state_and_data;
 ended(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
@@ -281,12 +303,12 @@ ended({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) ->
             lager:debug("ended stream restarting, asked to seek to ~p", [RPos2]),
             {next_state, ready, S, postpone}
     end;
-ended({call, From}, {read, Len}, S = #state{buf = Buf}) when (size(Buf) > 0) ->
-    RealLen = if (Len > size(Buf)) -> size(Buf); true -> Len end,
-    <<Chunk:RealLen/binary, NewBuf/binary>> = Buf,
+ended({call, From}, {read, Len}, S = #state{blen = BL}) when (BL > 0) ->
+    RealLen = if (Len > BL) -> BL; true -> Len end,
+    {Chunk, S1} = take_buf(RealLen, S),
     gen_statem:reply(From, {ok, Chunk}),
-    S1 = S#state{buf = NewBuf, rpos = S#state.rpos + RealLen},
-    {next_state, ended, S1};
+    S2 = S1#state{rpos = S#state.rpos + RealLen},
+    {next_state, ended, S2};
 ended({call, From}, {read, _Len}, S = #state{}) ->
     gen_statem:reply(From, eof),
     {next_state, ended, S};
@@ -329,11 +351,11 @@ errored({call, From}, close, #state{gun = Gun}) ->
     {stop, normal}.
 
 
-maybe_reply_reader(S = #state{reader = {From, Len}, buf = Buf}) when (size(Buf) >= Len) ->
-    <<Chunk:Len/binary, Rem/binary>> = Buf,
+maybe_reply_reader(S = #state{reader = {From, Len}, blen = BL}) when (BL >= Len) ->
+    {Chunk, S1} = take_buf(Len, S),
     RPos2 = S#state.rpos + Len,
     gen_statem:reply(From, {ok, Chunk}),
-    S#state{buf = Rem, rpos = RPos2, reader = none};
+    S1#state{rpos = RPos2, reader = none};
 maybe_reply_reader(S = #state{}) -> S.
 
 
@@ -361,7 +383,7 @@ skipping(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gu
             ToKeep = SPos2 - RPos,
             ToDiscard = size(Data) - ToKeep,
             <<_Dropped:ToDiscard/binary, Rem/binary>> = Data,
-            S2 = S1#state{buf = Rem, spos = SPos2, ackref = AckRef},
+            S2 = S1#state{buf = [Rem], blen = size(Rem), spos = SPos2, ackref = AckRef},
             lager:debug("skip ended, bufsz = ~p, spos = ~p", [size(Rem), SPos2]),
             S3 = maybe_reply_reader(S2),
             {next_state, flowing, S3};
@@ -381,7 +403,7 @@ skipping(info, {gun_data, Gun, Stream, fin, Data, AckRef}, S = #state{gun = Gun,
         (SPos2 > RPos) ->
             ToDiscard = size(Data) - (SPos2 - RPos),
             <<_Dropped:ToDiscard/binary, Rem/binary>> = Data,
-            S2 = S1#state{buf = Rem, spos = SPos2, ackref = AckRef},
+            S2 = S1#state{buf = [Rem], blen = size(Rem), spos = SPos2, ackref = AckRef},
             lager:debug("skip ended at eof, bufsz = ~p, spos = ~p", [size(Rem), SPos2]),
             S3 = maybe_reply_reader(S2),
             {next_state, ended, S3};
@@ -412,12 +434,12 @@ flowing(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
     Gun ! {gun_data_ack, self(), Stream, AckRef},
     {keep_state, S#state{ackref = none}};
 
-flowing({call, From}, {read, Len}, S = #state{buf = Buf}) when (size(Buf) >= Len) ->
-    <<Chunk:Len/binary, NewBuf/binary>> = Buf,
+flowing({call, From}, {read, Len}, S = #state{blen = BL}) when (BL >= Len) ->
+    {Chunk, S1} = take_buf(Len, S),
     gen_statem:reply(From, {ok, Chunk}),
     Pos = S#state.rpos + Len,
-    S1 = S#state{buf = NewBuf, reader = none, rpos = Pos},
-    {next_state, flowing, S1};
+    S2 = S1#state{reader = none, rpos = Pos},
+    {next_state, flowing, S2, [hibernate]};
 flowing({call, From}, {read, Len}, S = #state{}) ->
     {next_state, flowing, S#state{reader = {From, Len}}};
 flowing({call, From}, {write, _Data}, #state{}) ->
@@ -434,20 +456,19 @@ flowing({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) 
     if
         (RPos2 == RPos) ->
             gen_statem:reply(From, {ok, RPos2}),
-            {next_state, flowing, S};
+            {next_state, flowing, S, [hibernate]};
         (RPos2 > SPos) ->
-            S1 = S#state{buf = <<>>, rpos = RPos2, waiter = From},
+            S1 = S#state{buf = [], blen=0, rpos = RPos2, waiter = From},
             lager:debug("skipping ahead to ~p (at ~p)", [RPos2, RPos]),
-            {next_state, skipping, S1};
+            {next_state, skipping, S1, [hibernate]};
         (RPos2 > RPos) ->
-            Buf1 = S#state.buf,
             ToDrop = RPos2 - RPos,
-            <<_Dropped:ToDrop/binary, Buf2/binary>> = Buf1,
-            S1 = S#state{rpos = RPos2, buf = Buf2},
+            {_Dropped, S1} = take_buf(ToDrop, S),
+            S2 = S1#state{rpos = RPos2},
             gen_statem:reply(From, {ok, RPos2}),
             lager:debug("dropping ~p bytes to reach ~p (was at ~p)", [ToDrop,
                 RPos2, RPos]),
-            {next_state, flowing, S1};
+            {next_state, flowing, S2, [hibernate]};
         true ->
             lager:debug("seeking backwards to ~p from ~p", [RPos2, RPos]),
             #state{gun = Gun, stream = Stream} = S,
@@ -457,22 +478,21 @@ flowing({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) 
     end;
 
 flowing(info, {gun_data, Gun, Stream, fin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
-    #state{buf = Buf0, spos = SPos} = S,
-    Buf1 = <<Buf0/binary, Data/binary>>,
+    #state{spos = SPos} = S,
+    S1 = append_buf(Data, S),
     SPos2 = SPos + size(Data),
-    S1 = S#state{spos = SPos2, buf = Buf1},
-    S2 = maybe_reply_reader(S1),
-    S3 = S2#state{ackref = AckRef},
-    {next_state, ended, S3};
+    S2 = S1#state{spos = SPos2},
+    S3 = maybe_reply_reader(S2),
+    S4 = S3#state{ackref = AckRef},
+    {next_state, ended, S4};
 flowing(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
-    #state{buf = Buf0, spos = SPos} = S,
-    Buf1 = <<Buf0/binary, Data/binary>>,
+    #state{spos = SPos} = S,
     SPos2 = SPos + size(Data),
-    S1 = S#state{spos = SPos2, buf = Buf1},
+    S1 = append_buf(Data, S#state{spos = SPos2}),
     S2 = maybe_reply_reader(S1),
     S3 = S2#state{ackref = AckRef},
     if
-        (size(S3#state.buf) > ?BUF_MAX) -> {next_state, corked, S3};
+        (S3#state.blen > ?BUF_MAX) -> {next_state, corked, S3, [hibernate]};
         true -> {repeat_state, S3}
     end;
 
@@ -497,14 +517,14 @@ flowing({call, From}, close, S = #state{gun = Gun, stream = Stream}) ->
 corked(enter, _, #state{}) ->
     keep_state_and_data;
 
-corked({call, From}, {read, Len}, S = #state{buf = Buf}) when (size(Buf) >= Len) ->
-    <<Chunk:Len/binary, NewBuf/binary>> = Buf,
+corked({call, From}, {read, Len}, S = #state{blen = BL}) when (BL >= Len) ->
+    {Chunk, S1} = take_buf(Len, S),
     gen_statem:reply(From, {ok, Chunk}),
     Pos = S#state.rpos + Len,
-    S2 = S#state{buf = NewBuf, rpos = Pos, reader = none},
+    S2 = S1#state{rpos = Pos, reader = none},
     if
-        (size(NewBuf) > ?BUF_MAX) -> {repeat_state, S2};
-        true -> {next_state, flowing, S2}
+        (S2#state.blen > ?BUF_MAX) -> {repeat_state, S2, [hibernate]};
+        true -> {next_state, flowing, S2, [hibernate]}
     end;
 corked({call, From}, {read, Len}, S = #state{}) ->
     {next_state, flowing, S#state{reader = {From, Len}}};
@@ -516,13 +536,11 @@ corked({call, From}, {write, _Data}, #state{}) ->
     keep_state_and_data;
 
 corked(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
-    #state{buf = Buf0} = S,
-    Buf1 = <<Buf0/binary, Data/binary>>,
-    {keep_state, S#state{buf = Buf1, ackref = AckRef}};
+    S1 = append_buf(Data, S),
+    {keep_state, S1#state{ackref = AckRef}};
 corked(info, {gun_data, Gun, Stream, fin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
-    #state{buf = Buf0} = S,
-    Buf1 = <<Buf0/binary, Data/binary>>,
-    {next_state, ended, S#state{buf = Buf1, ackref = AckRef}};
+    S1 = append_buf(Data, S),
+    {next_state, ended, S1#state{ackref = AckRef}};
 
 corked(info, {gun_error, Gun, Stream, Reason}, S = #state{gun = Gun, stream = Stream}) ->
     {next_state, errored, S#state{error = {gun_strm_error, Reason}}};
