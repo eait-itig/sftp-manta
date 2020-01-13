@@ -53,7 +53,8 @@ start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
     reader = none,
     mref,
     wpos = 0,
-    rlimit = 0
+    rlimit = 0,
+    shovelpid = none
     }).
 
 callback_mode() -> [state_functions, state_enter].
@@ -204,9 +205,24 @@ flowing({call, From}, {position, Offset}, S = #state{wpos = WPos}) ->
         (WPos2 == WPos) ->
             gen_statem:reply(From, {ok, WPos2}),
             {next_state, flowing, S};
-        %(WPos2 > WPos) ->
-        %    S2 = S#state{waiter = From, rlimit = WPos2 - WPos},
-        %    {next_state, reading, S2};
+        (WPos2 > WPos) ->
+            S2 = S#state{waiter = From, rlimit = WPos2 - WPos},
+            #state{host = Host, port = Port, path = Path} = S2,
+            {ok, ReadFSM} = case S2 of
+                #state{amode = signature, signer = Signer} ->
+                    file_read_fsm:start_link({Host, Port}, Path, signature, Signer);
+                #state{amode = token, token = Token} ->
+                    file_read_fsm:start_link({Host, Port}, Path, token, Token)
+            end,
+            ok = gen_statem:call(ReadFSM, connect),
+            WriteFSM = self(),
+            Bytes = WPos2 - WPos,
+            ShovelPid = spawn_link(fun () ->
+                ok = read_loop(WriteFSM, ReadFSM, Bytes),
+                ok = gen_statem:call(ReadFSM, close),
+                gen_statem:reply(From, {ok, WPos2})
+            end),
+            {next_state, flowing, S2#state{shovelpid = ShovelPid}};
         true ->
             lager:warning("write_fsm for ~p tried to rewind/skip from ~p to "
                 "~p", [S#state.path, WPos, WPos2]),
