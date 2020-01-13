@@ -29,6 +29,7 @@
 
 -include_lib("public_key/include/public_key.hrl").
 -include_lib("kernel/include/file.hrl").
+-include_lib("ssh/src/ssh_connect.hrl").
 -compile([{parse_transform, lager_transform}]).
 
 -behaviour(application).
@@ -42,6 +43,9 @@
      read_file_info/2, read_link/2, read_link_info/2, rename/3,
      write/3, write_file_info/3]).
 -export([validate_pw/4]).
+
+% for ssh_cli
+-export([init/1, handle_ssh_msg/2, handle_msg/2, terminate/2]).
 
 start(_StartType, _StartArgs) ->
     sftp_manta_sup:start_link().
@@ -182,6 +186,270 @@ validate_pw(User, Pw, _RemoteAddr, _State) ->
     next_fd = 10,
     peer
     }).
+
+-record(scp_opts, {
+    verbose = false,
+    recursive = false,
+    directory = false,
+    mode = receiver,
+    bad = false,
+    target
+}).
+
+-record(scp_state, {
+    state = #state{},
+    buf = <<>>,
+    hadeof = false,
+    pid,
+    srvpid,
+    cmd,
+    chan,
+    cm,
+    cwdstack = []
+}).
+
+
+init(_) ->
+    process_flag(trap_exit, true),
+    {ok, #scp_state{pid = self()}}.
+
+terminate(_Reason, #scp_state{state = SS}) ->
+    case SS of
+        #state{gun = undefined} -> ok;
+        _ -> logout(SS)
+    end.
+
+handle_msg({write, Pid, Data}, S = #scp_state{cm = CM, chan = ChanId, srvpid = Pid}) ->
+    ssh_connection:send(CM, ChanId, ?SSH_EXTENDED_DATA_DEFAULT, Data),
+    {ok, S};
+handle_msg({exit, Pid, ExSt}, S = #scp_state{cm = CM, chan = ChanId, srvpid = Pid}) ->
+    ssh_connection:exit_status(CM, ChanId, ExSt),
+    ssh_connection:send_eof(CM, ChanId),
+    {stop, ChanId, S};
+handle_msg({'EXIT', Pid, Reason}, S = #scp_state{cm = CM, chan = ChanId, srvpid = Pid}) ->
+    ssh_connection:send(CM, ChanId, ?SSH_EXTENDED_DATA_DEFAULT,
+        [<<2>>, io_lib:format("Error: ~999p\n", [Reason])]),
+    ssh_connection:exit_status(CM, ChanId, -1),
+    ssh_connection:send_eof(CM, ChanId),
+    {stop, ChanId, S};
+handle_msg(_Msg, S = #scp_state{}) ->
+    {ok, S}.
+
+handle_ssh_msg({ssh_cm, CM, {exec, ChanId, WantRep, Cmd}}, S = #scp_state{state = SS0}) ->
+    MantaHostInfo = application:get_env(sftp_manta, manta, []),
+    MantaHost = proplists:get_value(host, MantaHostInfo),
+    MantaPort = proplists:get_value(port, MantaHostInfo, 443),
+    {ok, Mode} = application:get_env(sftp_manta, auth_mode),
+    SS1 = SS0#state{host = MantaHost, port = MantaPort, amode = Mode},
+    [{user, User}] = ssh_connection_handler:connection_info(CM, [user]),
+    SS2 = login(User, SS1),
+    SS3 = SS2#state{cwd = "/" ++ User ++ "/stor"},
+    S1 = S#scp_state{state = SS3},
+    lager:debug("handling command ~p for ~p", [Cmd, User]),
+    case list_to_binary(Cmd) of
+        <<"scp ", Rem/binary>> ->
+            case parse_scp_opts(#scp_opts{}, Rem) of
+                Opts = #scp_opts{bad = false} ->
+                    S2 = S1#scp_state{cmd = Cmd, chan = ChanId, cm = CM},
+                    ScpServPid = spawn_link(fun() ->
+                        scp_server_loop(Opts, S1)
+                    end),
+                    ssh_connection:reply_request(CM, WantRep, success, ChanId),
+                    S3 = S2#scp_state{srvpid = ScpServPid},
+                    {ok, S3};
+
+                #scp_opts{bad = BadOpt} ->
+                    ssh_connection:send(CM, ChanId, ?SSH_EXTENDED_DATA_DEFAULT,
+                        [<<2>>, io_lib:format("Unsupported scp option: -~s\n",
+                        [BadOpt])]),
+                    ssh_connection:reply_request(CM, WantRep, success, ChanId),
+                    ssh_connection:exit_status(CM, ChanId, -1),
+                    ssh_connection:send_eof(CM, ChanId),
+                    {stop, ChanId, S1#scp_state{cm = CM, chan = ChanId}}
+            end;
+        _ ->
+            ssh_connection:send(CM, ChanId, ?SSH_EXTENDED_DATA_DEFAULT,
+                io_lib:format("Unsupported command: ~99p\n", [Cmd])),
+            ssh_connection:reply_request(CM, WantRep, success, ChanId),
+            ssh_connection:exit_status(CM, ChanId, -1),
+            ssh_connection:send_eof(CM, ChanId),
+            {stop, ChanId, S1#scp_state{cm = CM, chan = ChanId}}
+    end;
+
+handle_ssh_msg({ssh_cm, CM, {shell, ChanId, WantRep}}, S = #scp_state{}) ->
+    ssh_connection:reply_request(CM, WantRep, success, ChanId),
+    ssh_connection:send(CM, ChanId, ?SSH_EXTENDED_DATA_DEFAULT,
+        <<"Interactive shell not supported.\n">>),
+    ssh_connection:exit_status(CM, ChanId, -1),
+    ssh_connection:send_eof(CM, ChanId),
+    {stop, ChanId, S#scp_state{cm = CM, chan = ChanId}};
+
+handle_ssh_msg({ssh_cm, CM, {data, _ChanId, _Type, Data}}, S = #scp_state{cm = CM, pid = Me, srvpid = Pid}) ->
+    Pid ! {data, Me, Data},
+    {ok, S};
+
+handle_ssh_msg({ssh_cm, CM, {eof, ChanId}}, S = #scp_state{cm = CM, pid = Me, srvpid = Pid}) ->
+    Pid ! {eof, Me},
+    {ok, S};
+
+handle_ssh_msg(_Msg, S = #scp_state{}) ->
+    {ok, S}.
+
+parse_scp_opts(O, <<>>) -> O;
+parse_scp_opts(O, <<" ", Rem/binary>>) -> parse_scp_opts(O, Rem);
+parse_scp_opts(O, <<"\t", Rem/binary>>) -> parse_scp_opts(O, Rem);
+parse_scp_opts(O, <<"-v ", Rem/binary>>) ->
+    parse_scp_opts(O#scp_opts{verbose = true}, Rem);
+parse_scp_opts(O, <<"-d ", Rem/binary>>) ->
+    parse_scp_opts(O#scp_opts{directory = true}, Rem);
+parse_scp_opts(O, <<"-r ", Rem/binary>>) ->
+    parse_scp_opts(O#scp_opts{recursive = true}, Rem);
+parse_scp_opts(O, <<"-f ", Target/binary>>) ->
+    O#scp_opts{mode = sender, target = Target};
+parse_scp_opts(O, <<"-t ", Target/binary>>) ->
+    O#scp_opts{mode = receiver, target = Target};
+parse_scp_opts(O, <<"-", Opt:1/binary, Rem/binary>>) ->
+    O#scp_opts{bad = Opt}.
+
+await_line(S = #scp_state{buf = <<>>, hadeof = true}) ->
+    {eof, S};
+await_line(S = #scp_state{pid = C, buf = B}) ->
+    case binary:split(B, [<<"\n">>]) of
+        [L, B2] -> {L, S#scp_state{buf = B2}};
+        [B2] when S#scp_state.hadeof -> {B2, S#scp_state{buf = <<>>}};
+        [B2] ->
+            receive
+                {data, C, Data} ->
+                    B3 = <<B2/binary, Data/binary>>,
+                    await_line(S#scp_state{buf = B3});
+                {eof, C} ->
+                    await_line(S#scp_state{hadeof = true})
+            end
+    end.
+
+await_bytes(N, S = #scp_state{buf = <<>>, hadeof = true}) ->
+    {eof, S};
+await_bytes(N, S = #scp_state{pid = C, buf = B}) ->
+    case B of
+        <<R:N/binary, B2/binary>> -> {R, S#scp_state{buf = B2}};
+        _ when S#scp_state.hadeof -> {B, S#scp_state{buf = <<>>}};
+        _ ->
+            receive
+                {data, C, Data} ->
+                    B2 = <<B/binary, Data/binary>>,
+                    await_bytes(N, S#scp_state{buf = B2});
+                {eof, C} ->
+                    await_bytes(N, S#scp_state{hadeof = true})
+            end
+    end.
+
+scp_server_loop(Opts, {stop, #scp_state{pid = C}}) ->
+    C ! {exit, self(), 0};
+scp_server_loop(Opts, {error, Msg, #scp_state{pid = C}}) ->
+    C ! {write, self(), <<2, Msg/binary, "\n">>},
+    C ! {exit, self(), 1};
+scp_server_loop(Opts = #scp_opts{mode = sender, target = T},
+        S0 = #scp_state{pid = C, buf = B}) ->
+    lager:debug("TODO: implement sender mode"),
+    C ! {write, self(), <<2, "scp source mode not implemented\n">>},
+    C ! {exit, self(), 1};
+scp_server_loop(Opts = #scp_opts{mode = receiver, target = <<".">>},
+        S0 = #scp_state{pid = C}) ->
+    C ! {write, self(), <<0>>},
+    {L, S1} = await_line(S0),
+    SS = S1#scp_state.state,
+    lager:debug("read line ~p", [L]),
+    Snext = case L of
+        <<"C", _/binary>> ->
+            [<<"C", ModeBin:4/binary>>, Rest0] = binary:split(L, [<<" ">>]),
+            [LenBin, PathBin] = binary:split(Rest0, [<<" ">>]),
+            Mode = binary_to_integer(ModeBin, 8),
+            Len = binary_to_integer(LenBin),
+            lager:debug("scp writing file ~p (~p bytes)", [PathBin, Len]),
+            C ! {write, self(), <<0>>},
+            Path = SS#state.cwd ++ "/" ++
+                unicode:characters_to_list(PathBin, utf8),
+            S2 = scp_write_file(Opts, Path, Len, S1),
+            {<<0>>, S3} = await_bytes(1, S2),
+            S3;
+        <<"D", _/binary>> when Opts#scp_opts.recursive ->
+            [<<"D", ModeBin:4/binary>>, Rest0] = binary:split(L, [<<" ">>]),
+            [LenBin, PathBin] = binary:split(Rest0, [<<" ">>]),
+            NewCwd = SS#state.cwd ++ "/" ++
+                unicode:characters_to_list(PathBin, utf8),
+            Stack = [SS#state.cwd | S1#scp_state.cwdstack],
+            SS1 = SS#state{cwd = NewCwd},
+            case make_dir(NewCwd, SS1) of
+                {ok, SS2} ->
+                    S1#scp_state{cwdstack = Stack, state = SS2};
+                {Error, SS2} ->
+                    {error, iolist_to_binary(io_lib:format("~999p", [Error])),
+                        S1#scp_state{state = SS2}}
+            end;
+        <<"E">> when Opts#scp_opts.recursive ->
+            [OldCwd | Stack] = S1#scp_state.cwdstack,
+            S1#scp_state{state = SS#state{cwd = OldCwd}, cwdstack = Stack};
+        <<"T", _/binary>> ->
+            S1;
+        eof ->
+            {stop, S1}
+    end,
+    scp_server_loop(Opts, Snext);
+scp_server_loop(Opts = #scp_opts{mode = receiver, target = T}, S0 = #scp_state{}) ->
+    SS0 = S0#scp_state.state,
+    Cwd0 = SS0#state.cwd,
+    Cwd1 = case T of
+        <<"/", _/binary>> -> unicode:characters_to_list(T, utf8);
+        <<"./", Rest/binary>> -> Cwd0 ++ "/" ++ unicode:characters_to_list(Rest, utf8);
+        _ -> Cwd0 ++ "/" ++ unicode:characters_to_list(T, utf8)
+    end,
+    S1 = S0#scp_state{state = SS0#state{cwd = Cwd1}},
+    scp_server_loop(Opts#scp_opts{target = <<".">>}, S1).
+
+scp_write_file(Opts = #scp_opts{}, Path, Len, SC0 = #scp_state{state = S0, pid = C}) ->
+    #state{host = Host, port = Port} = S0,
+    {ok, Fsm} = case S0 of
+        #state{amode = operator, signer = Signer} ->
+            file_write_fsm:start_link({Host, Port}, path_to_uri(Path), signature, Signer);
+        #state{amode = mahi_plus_token, token = Token} ->
+            file_write_fsm:start_link({Host, Port}, path_to_uri(Path), token, Token)
+    end,
+    case gen_statem:call(Fsm, connect) of
+        ok -> ok;
+        {error, {http, 404, #{<<"code">> := <<"ResourceNotFound">>}}} ->
+            ErrBin = iolist_to_binary(io_lib:format(
+                "Parent directory for ~s does not exist\n", [Path])),
+            C ! {write, self(), <<2, " ", ErrBin/binary>>},
+            C ! {exit, self(), 2},
+            exit(normal);
+        {error, {http, _, #{<<"code">> := Code, <<"message">> := Msg}}} ->
+            ErrBin = iolist_to_binary(io_lib:format("~p: ~s\n", [Code, Msg])),
+            C ! {write, self(), <<2, " ", ErrBin/binary>>},
+            C ! {exit, self(), 3},
+            exit(normal);
+        {error, {http, Code}} ->
+            ErrBin = iolist_to_binary(io_lib:format(
+                "manta returned HTTP ~p\n", [Code])),
+            C ! {write, self(), <<2, " ", ErrBin/binary>>},
+            C ! {exit, self(), 4},
+            exit(normal);
+        {error, Err} ->
+            ErrBin = iolist_to_binary(io_lib:format("~999p\n", [Err])),
+            C ! {write, self(), <<2, " ", ErrBin/binary>>},
+            C ! {exit, self(), 5},
+            exit(normal)
+    end,
+    SC1 = scp_write_next_chunk(Opts, Fsm, Len, SC0),
+    ok = gen_statem:call(Fsm, close),
+    SC1.
+
+scp_write_next_chunk(Opts, Fsm, 0, S0) -> S0;
+scp_write_next_chunk(Opts, Fsm, RemLen, S0 = #scp_state{}) ->
+    ToRead = if (RemLen > 16384) -> 16384; true -> RemLen end,
+    {Data, S1} = await_bytes(ToRead, S0),
+    RemLen2 = RemLen - byte_size(Data),
+    ok = gen_statem:call(Fsm, {write, Data}),
+    scp_write_next_chunk(Opts, Fsm, RemLen2, S1).
 
 path_to_uri(Path) when is_list(Path) ->
     path_to_uri(unicode:characters_to_binary(Path, utf8));

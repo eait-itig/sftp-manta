@@ -56,7 +56,7 @@ init([]) ->
         ]),
     SSHOpts = [
         {subsystems, [SFTPSpec]},
-        {shell, {sftp_manta_shell, start, []}},
+        {ssh_cli, {sftp_manta_app, []}},
         {pwdfun, fun sftp_manta_app:validate_pw/4},
         {key_cb, {sftp_manta_app, []}},
         {preferred_algorithms, [

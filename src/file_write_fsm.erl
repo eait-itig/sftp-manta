@@ -50,8 +50,10 @@ start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
     stream,
     error,
     waiter = none,
+    reader = none,
     mref,
-    wpos = 0
+    wpos = 0,
+    rlimit = 0
     }).
 
 callback_mode() -> [state_functions, state_enter].
@@ -141,10 +143,37 @@ disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path =
     },
     Stream = request(put, Path, InHdrs, S1),
     receive
-        {gun_inform, Gun, Stream, 100, _} -> ok
-    end,
-    gen_statem:reply(From, ok),
-    {next_state, flowing, S1#state{stream = Stream}}.
+        {gun_inform, Gun, Stream, 100, _} ->
+            gen_statem:reply(From, ok),
+            {next_state, flowing, S1#state{stream = Stream}};
+        {gun_inform, Gun, Stream, Status, Headers} ->
+            gen_statem:reply(From, {error, {http, Status}}),
+            gun:close(Gun),
+            {stop, normal};
+        {gun_response, Gun, Stream, fin, Status, Headers} ->
+            gen_statem:reply(From, {error, {http, Status}}),
+            gun:close(Gun),
+            {stop, normal};
+        {gun_response, Gun, Stream, nofin, Status, Headers} ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            ErrInfo = case ContentType of
+                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                _ -> {http, Status, Body}
+            end,
+            case ErrInfo of
+                _ ->
+                    lager:debug("put returned ~p", [ErrInfo]),
+                    gen_statem:reply(From, {error, ErrInfo}),
+                    gun:close(Gun),
+                    {stop, normal}
+            end;
+        Other ->
+            lager:debug("got weird messge: ~p", [Other]),
+            gen_statem:reply(From, {error, what}),
+            {stop, normal}
+    end.
 
 flowing(enter, _, #state{}) ->
     keep_state_and_data;
@@ -175,6 +204,9 @@ flowing({call, From}, {position, Offset}, S = #state{wpos = WPos}) ->
         (WPos2 == WPos) ->
             gen_statem:reply(From, {ok, WPos2}),
             {next_state, flowing, S};
+        %(WPos2 > WPos) ->
+        %    S2 = S#state{waiter = From, rlimit = WPos2 - WPos},
+        %    {next_state, reading, S2};
         true ->
             lager:warning("write_fsm for ~p tried to rewind/skip from ~p to "
                 "~p", [S#state.path, WPos, WPos2]),
@@ -213,6 +245,15 @@ flowing({call, From}, close, #state{gun = Gun, stream = Stream}) ->
             gen_statem:reply(From, {error, ErrInfo}),
             {stop, normal}
     end.
+
+read_loop(WriteFSM, ReadFSM, 0) ->
+    ok;
+read_loop(WriteFSM, ReadFSM, N) ->
+    ToRead = if (N > 131072) -> 131072; true -> N end,
+    {ok, Bytes} = gen_statem:call(ReadFSM, {read, ToRead}),
+    Rem = N - byte_size(Bytes),
+    ok = gen_statem:call(WriteFSM, {write, Bytes}),
+    read_loop(WriteFSM, ReadFSM, Rem).
 
 errored(enter, _, S = #state{error = Err, waiter = Waiter}) ->
     case Waiter of
