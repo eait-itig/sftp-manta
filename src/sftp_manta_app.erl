@@ -198,7 +198,7 @@ validate_pw(User, Pw, _RemoteAddr, _State) ->
 
 -record(scp_state, {
     state = #state{},
-    buf = <<>>,
+    buf = [],
     hadeof = false,
     pid,
     srvpid,
@@ -311,36 +311,43 @@ parse_scp_opts(O, <<"-t ", Target/binary>>) ->
 parse_scp_opts(O, <<"-", Opt:1/binary, Rem/binary>>) ->
     O#scp_opts{bad = Opt}.
 
-await_line(S = #scp_state{buf = <<>>, hadeof = true}) ->
+await_line(S = #scp_state{buf = [], hadeof = true}) ->
     {eof, S};
-await_line(S = #scp_state{pid = C, buf = B}) ->
-    case binary:split(B, [<<"\n">>]) of
-        [L, B2] -> {L, S#scp_state{buf = B2}};
-        [B2] when S#scp_state.hadeof -> {B2, S#scp_state{buf = <<>>}};
+await_line(S = #scp_state{pid = C, buf = B0}) ->
+    B1 = iolist_to_binary(B0),
+    case binary:split(B1, [<<"\n">>]) of
+        [L, B2] -> {L, S#scp_state{buf = [B2]}};
+        [B2] when S#scp_state.hadeof -> {B2, S#scp_state{buf = []}};
         [B2] ->
             receive
                 {data, C, Data} ->
                     B3 = <<B2/binary, Data/binary>>,
-                    await_line(S#scp_state{buf = B3});
+                    await_line(S#scp_state{buf = [B3]});
                 {eof, C} ->
                     await_line(S#scp_state{hadeof = true})
             end
     end.
 
-await_bytes(N, S = #scp_state{buf = <<>>, hadeof = true}) ->
+await_bytes(N, S = #scp_state{buf = [], hadeof = true}) ->
     {eof, S};
-await_bytes(N, S = #scp_state{pid = C, buf = B}) ->
-    case B of
-        <<R:N/binary, B2/binary>> -> {R, S#scp_state{buf = B2}};
-        _ when S#scp_state.hadeof -> {B, S#scp_state{buf = <<>>}};
-        _ ->
-            receive
-                {data, C, Data} ->
-                    B2 = <<B/binary, Data/binary>>,
-                    await_bytes(N, S#scp_state{buf = B2});
-                {eof, C} ->
-                    await_bytes(N, S#scp_state{hadeof = true})
-            end
+await_bytes(N, S = #scp_state{buf = [Chunk0 | B1]}) ->
+    if
+        (N < byte_size(Chunk0)) ->
+            R = binary_part(Chunk0, 0, N),
+            Chunk1 = binary_part(Chunk0, N, byte_size(Chunk0) - N),
+            {R, S#scp_state{buf = [Chunk1 | B1]}};
+        (N == byte_size(Chunk0)) ->
+            {Chunk0, S#scp_state{buf = B1}};
+        (N > byte_size(Chunk0)) ->
+            {Rest, S2} = await_bytes(N, S#scp_state{buf = B1}),
+            {<<Chunk0/binary, Rest/binary>>, S2}
+    end;
+await_bytes(N, S = #scp_state{pid = C, buf = []}) ->
+    receive
+        {data, C, Data} ->
+            await_bytes(N, S#scp_state{buf = [Data]});
+        {eof, C} ->
+            await_bytes(N, S#scp_state{hadeof = true})
     end.
 
 scp_server_loop(Opts, {stop, #scp_state{pid = C}}) ->
@@ -449,6 +456,7 @@ scp_write_next_chunk(Opts, Fsm, RemLen, S0 = #scp_state{}) ->
     {Data, S1} = await_bytes(ToRead, S0),
     RemLen2 = RemLen - byte_size(Data),
     ok = gen_statem:call(Fsm, {write, Data}),
+    erlang:garbage_collect(),
     scp_write_next_chunk(Opts, Fsm, RemLen2, S1).
 
 path_to_uri(Path) when is_list(Path) ->

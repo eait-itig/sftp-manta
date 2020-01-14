@@ -439,7 +439,7 @@ flowing({call, From}, {read, Len}, S = #state{blen = BL}) when (BL >= Len) ->
     gen_statem:reply(From, {ok, Chunk}),
     Pos = S#state.rpos + Len,
     S2 = S1#state{reader = none, rpos = Pos},
-    {next_state, flowing, S2, [hibernate]};
+    {next_state, flowing, S2};
 flowing({call, From}, {read, Len}, S = #state{}) ->
     {next_state, flowing, S#state{reader = {From, Len}}};
 flowing({call, From}, {write, _Data}, #state{}) ->
@@ -456,7 +456,7 @@ flowing({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) 
     if
         (RPos2 == RPos) ->
             gen_statem:reply(From, {ok, RPos2}),
-            {next_state, flowing, S, [hibernate]};
+            {next_state, flowing, S};
         (RPos2 > SPos) ->
             S1 = S#state{buf = [], blen=0, rpos = RPos2, waiter = From},
             lager:debug("skipping ahead to ~p (at ~p)", [RPos2, RPos]),
@@ -492,7 +492,7 @@ flowing(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gun
     S2 = maybe_reply_reader(S1),
     S3 = S2#state{ackref = AckRef},
     if
-        (S3#state.blen > ?BUF_MAX) -> {next_state, corked, S3, [hibernate]};
+        (S3#state.blen > ?BUF_MAX) -> {next_state, corked, S3};
         true -> {repeat_state, S3}
     end;
 
@@ -524,7 +524,7 @@ corked({call, From}, {read, Len}, S = #state{blen = BL}) when (BL >= Len) ->
     S2 = S1#state{rpos = Pos, reader = none},
     if
         (S2#state.blen > ?BUF_MAX) -> {repeat_state, S2, [hibernate]};
-        true -> {next_state, flowing, S2, [hibernate]}
+        true -> {next_state, flowing, S2}
     end;
 corked({call, From}, {read, Len}, S = #state{}) ->
     {next_state, flowing, S#state{reader = {From, Len}}};
