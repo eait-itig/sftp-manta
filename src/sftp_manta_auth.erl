@@ -192,6 +192,7 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
         {ok, _Account} ->
             case krb_client:authenticate(Krb, User, Pw) of
                 ok ->
+                    lager:debug("authed ~p with password", [User]),
                     {reply, true, S0};
                 {error, Why} ->
                     lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
