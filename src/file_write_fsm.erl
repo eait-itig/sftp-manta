@@ -115,6 +115,16 @@ fn_ext_to_mime(Fname) ->
         _ -> <<"application/octet-stream">>
     end.
 
+dur_level(Fname) when is_list(Fname) ->
+    dur_level(unicode:characters_to_binary(Fname, utf8));
+dur_level(Fname) ->
+    Parts = binary:split(Fname, <<"/">>, [global]),
+    case Parts of
+        [<<>>, _, <<"stor">>, <<"archive">> | _] -> <<"1">>;
+        [<<>>, _, <<"public">>, <<"archive">> | _] -> <<"1">>;
+        _ -> <<"2">>
+    end.
+
 init([{Host, Port}, Path, signature, Signer]) ->
     S0 = #state{host = Host, port = Port, path = Path,
         amode = signature, signer = Signer},
@@ -138,9 +148,11 @@ disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path =
     MRef = monitor(process, Gun),
     S1 = S0#state{gun = Gun, mref = MRef},
     Mime = fn_ext_to_mime(Path),
+    Dur = dur_level(Path),
     InHdrs = #{
         <<"content-type">> => Mime,
-        <<"expect">> => <<"100-continue">>
+        <<"expect">> => <<"100-continue">>,
+        <<"durability-level">> => Dur
     },
     Stream = request(put, Path, InHdrs, S1),
     receive
