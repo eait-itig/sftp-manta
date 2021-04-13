@@ -324,7 +324,7 @@ scp_server_loop(Opts = #scp_opts{mode = sender, target = T, recursive = false},
             #state{gun = Gun} = St0,
             case fetch_dir_lim(Gun, path_to_uri(Prefix), none, St0) of
                 {ok, Objs} ->
-                    {[{N, Sz} ||
+                    {[{iolist_to_binary([Prefix, $/, N]), Sz} ||
                         #{<<"name">> := N, <<"size">> := Sz} <- Objs,
                         match_part(Rest, N)], S0};
                 _ ->
