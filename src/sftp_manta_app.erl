@@ -255,11 +255,95 @@ await_bytes(N, S = #scp_state{pid = C, buf = []}) ->
             await_bytes(N, S#scp_state{hadeof = true})
     end.
 
+match_part(Patt, Str) when is_binary(Str) ->
+    match_part(Patt, unicode:characters_to_list(Str, utf8));
+match_part([question|Rest1], [_|Rest2]) ->
+    match_part(Rest1, Rest2);
+match_part([accept], _) ->
+    true;
+match_part([double_star], _) ->
+    true;
+match_part([star|Rest], File) ->
+    do_star(Rest, File);
+match_part([{one_of, Ordset}|Rest], [C|File]) ->
+    gb_sets:is_element(C, Ordset) andalso match_part(Rest, File);
+match_part([{alt, Alts}], File) ->
+    do_alt(Alts, File);
+match_part([C|Rest1], [C|Rest2]) when is_integer(C) ->
+    match_part(Rest1, Rest2);
+match_part([X|_], [Y|_]) when is_integer(X), is_integer(Y) ->
+    false;
+match_part([], []) ->
+    true;
+match_part([], [_|_]) ->
+    false;
+match_part([_|_], []) ->
+    false.
+
+do_star(Pattern, [_|Rest]=File) ->
+    match_part(Pattern, File) orelse do_star(Pattern, Rest);
+do_star(Pattern, []) ->
+    match_part(Pattern, []).
+
+do_alt([Alt|Rest], File) ->
+    match_part(Alt, File) orelse do_alt(Rest, File);
+do_alt([], _File) ->
+    false.
+
 scp_server_loop(Opts, {stop, #scp_state{pid = C}}) ->
     C ! {exit, self(), 0};
 scp_server_loop(Opts, {error, Msg, #scp_state{pid = C}}) ->
     C ! {write, self(), <<2, Msg/binary, "\n">>},
     C ! {exit, self(), 1};
+scp_server_loop(Opts = #scp_opts{mode = sender, target = T, recursive = false},
+        S0 = #scp_state{state = St0, pid = C, buf = B}) ->
+    TStr = unicode:characters_to_list(T, utf8),
+    {compiled_wildcard, Patt} = filelib:compile_wildcard(TStr),
+    {Files, S1} = case Patt of
+        {{exists, [$., $/ | File]}, 2} ->
+            #state{user = U} = St0,
+            N = iolist_to_binary([$/, U, "/stor/", File]),
+            case get_stat(N, St0) of
+                {ok, #file_info{size = Sz}, St1} ->
+                    {[{N, Sz}], S0#scp_state{state = St1}};
+                _ ->
+                    {[], S0}
+            end;
+        {[[$. | Dir], Rest], 2} ->
+            #state{user = U, gun = Gun} = St0,
+            N = iolist_to_binary([$/, U, "/stor", Dir]),
+            case fetch_dir_lim(Gun, path_to_uri(N), none, St0) of
+                {ok, Objs} ->
+                    {[{iolist_to_binary([N, $/, FN]), Sz} ||
+                        #{<<"name">> := FN, <<"size">> := Sz} <- Objs,
+                        match_part(Rest, FN)], S0};
+                _ ->
+                    {[], S0}
+            end;
+        {[Prefix, Rest], 0} ->
+            #state{gun = Gun} = St0,
+            case fetch_dir_lim(Gun, path_to_uri(Prefix), none, St0) of
+                {ok, Objs} ->
+                    {[{N, Sz} ||
+                        #{<<"name">> := N, <<"size">> := Sz} <- Objs,
+                        match_part(Rest, N)], S0};
+                _ ->
+                    {[], S0}
+            end
+    end,
+    lager:debug("scp sending files = ~p", [Files]),
+    case Files of
+        [] ->
+            C ! {write, self(), <<2, "no objects found\n">>},
+            C ! {exit, self(), 1};
+        _ ->
+            Snext = lists:foldl(fun ({Path, Sz}, SS0) ->
+                SS1 = scp_read_file(Opts, Path, Sz, SS0),
+                C ! {write, self(), <<0>>},
+                SS1
+            end, S0, Files),
+            C ! {exit, self(), 0}
+    end;
 scp_server_loop(Opts = #scp_opts{mode = sender, target = T},
         S0 = #scp_state{pid = C, buf = B}) ->
     lager:debug("TODO: implement sender mode"),
@@ -355,9 +439,59 @@ scp_write_file(Opts = #scp_opts{}, Path, Len, SC0 = #scp_state{state = S0, pid =
     ok = gen_statem:call(Fsm, close),
     SC1.
 
+scp_read_file(Opts = #scp_opts{}, Path, Len, SC0 = #scp_state{state = S0, pid = C}) ->
+    #state{host = Host, port = Port} = S0,
+    {ok, Fsm} = case S0 of
+        #state{amode = operator, signer = Signer} ->
+            file_read_fsm:start_link({Host, Port}, path_to_uri(Path), signature, Signer);
+        #state{amode = mahi_plus_token, token = Token} ->
+            file_read_fsm:start_link({Host, Port}, path_to_uri(Path), token, Token)
+    end,
+    case gen_statem:call(Fsm, connect) of
+        ok -> ok;
+        {error, {http, 404, #{<<"code">> := <<"ResourceNotFound">>}}} ->
+            ErrBin = iolist_to_binary(io_lib:format(
+                "Parent directory for ~s does not exist\n", [Path])),
+            C ! {write, self(), <<2, " ", ErrBin/binary>>},
+            C ! {exit, self(), 2},
+            exit(normal);
+        {error, {http, _, #{<<"code">> := Code, <<"message">> := Msg}}} ->
+            ErrBin = iolist_to_binary(io_lib:format("~p: ~s\n", [Code, Msg])),
+            C ! {write, self(), <<2, " ", ErrBin/binary>>},
+            C ! {exit, self(), 3},
+            exit(normal);
+        {error, {http, Code}} ->
+            ErrBin = iolist_to_binary(io_lib:format(
+                "manta returned HTTP ~p\n", [Code])),
+            C ! {write, self(), <<2, " ", ErrBin/binary>>},
+            C ! {exit, self(), 4},
+            exit(normal);
+        {error, Err} ->
+            ErrBin = iolist_to_binary(io_lib:format("~999p\n", [Err])),
+            C ! {write, self(), <<2, " ", ErrBin/binary>>},
+            C ! {exit, self(), 5},
+            exit(normal)
+    end,
+    PathParts = binary:split(Path, [<<"/">>], [global]),
+    Fname = lists:last(PathParts),
+    SzBin = integer_to_binary(Len),
+    C ! {write, self(), <<"C0644 ", SzBin/binary, " ", Fname/binary, "\n">>},
+    SC1 = scp_read_next_chunk(Opts, Fsm, Len, SC0),
+    ok = gen_statem:call(Fsm, close),
+    SC1.
+
+scp_read_next_chunk(Opts, Fsm, 0, S0) -> S0;
+scp_read_next_chunk(Opts, Fsm, RemLen, S0 = #scp_state{pid = C}) ->
+    ToRead = if (RemLen > 131072) -> 131072; true -> RemLen end,
+    {ok, Data} = gen_statem:call(Fsm, {read, ToRead}),
+    RemLen2 = RemLen - byte_size(Data),
+    C ! {write, self(), Data},
+    erlang:garbage_collect(),
+    scp_read_next_chunk(Opts, Fsm, RemLen2, S0).
+
 scp_write_next_chunk(Opts, Fsm, 0, S0) -> S0;
 scp_write_next_chunk(Opts, Fsm, RemLen, S0 = #scp_state{}) ->
-    ToRead = if (RemLen > 16384) -> 16384; true -> RemLen end,
+    ToRead = if (RemLen > 131072) -> 131072; true -> RemLen end,
     {Data, S1} = await_bytes(ToRead, S0),
     RemLen2 = RemLen - byte_size(Data),
     ok = gen_statem:call(Fsm, {write, Data}),
@@ -647,13 +781,18 @@ is_dir(AbsPath, S = #state{}) ->
             {false, S2}
     end.
 
-list_dir(AbsPath, S) when is_list(AbsPath) ->
-    list_dir(unicode:characters_to_binary(AbsPath, utf8), S);
-list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
+fetch_dir_lim(Gun, BaseUri, Marker, S) ->
     InHdrs = #{
         <<"accept">> => <<"application/json; type=directory">>
     },
-    Stream = request(get, path_to_uri(AbsPath), InHdrs, S),
+    Qs = [
+        {"limit", "1000"}
+        | case Marker of
+            none -> [];
+            _ -> [{"marker", unicode:characters_to_list(Marker, utf8)}]
+        end],
+    Uri = iolist_to_binary([BaseUri, "?", uri_string:compose_query(Qs)]),
+    Stream = request(get, Uri, InHdrs, S),
     case gun:await(Gun, Stream, 30000) of
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
@@ -663,7 +802,49 @@ list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
             {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
             Lines = binary:split(Body, [<<"\n">>], [global, trim]),
             Objs = [jsx:decode(Line, [return_maps]) || Line <- Lines],
+            case Objs of
+                [] ->
+                    {ok, Objs};
+                [#{<<"name">> := Marker}] ->
+                    {ok, []};
+                _ ->
+                    case Objs of
+                        [#{<<"name">> := Marker} | Rest] -> ok;
+                        Rest -> ok
+                    end,
+                    #{<<"name">> := Marker1} = lists:last(Objs),
+                    case fetch_dir_lim(Gun, BaseUri, Marker1, S) of
+                        {ok, RecurObjs} ->
+                            {ok, Rest ++ RecurObjs};
+                        Err ->
+                            Err
+                    end
+            end;
+        {response, nofin, Status, Headers} ->
+            Hdrs = maps:from_list(Headers),
+            ErrInfo = case Hdrs of
+                #{<<"content-type">> := ContentType} ->
+                    {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+                    case ContentType of
+                        <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                        _ -> {http, Status, Body}
+                    end;
+                _ ->
+                    {http, Status, none}
+            end,
+            lager:debug("list_dir returned ~p", [ErrInfo]),
+            {error, ErrInfo};
+        {response, _Mode, _Status, _Headers} ->
+            gun:cancel(Gun, Stream),
+            gun:flush(Stream),
+            {error, enotdir}
+    end.
 
+list_dir(AbsPath, S) when is_list(AbsPath) ->
+    list_dir(unicode:characters_to_binary(AbsPath, utf8), S);
+list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
+    case fetch_dir_lim(Gun, path_to_uri(AbsPath), none, S) of
+        {ok, Objs} ->
             Now = erlang:system_time(millisecond),
             Cache1 = lists:foldl(fun (Obj, Acc) ->
                 #{<<"name">> := Name} = Obj,
@@ -677,23 +858,9 @@ list_dir(AbsPath, S = #state{gun = Gun, statcache = Cache0}) ->
 
             Names = [Name || #{ <<"name">> := Name } <- Objs],
             {{ok, Names}, S#state{statcache = Cache1}};
-        {response, nofin, Status, Headers} ->
-            Hdrs = maps:from_list(Headers),
-            #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
-            ErrInfo = case ContentType of
-                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
-                _ -> {http, Status, Body}
-            end,
-            case ErrInfo of
-                _ ->
-                    lager:debug("list_dir returned ~p", [ErrInfo]),
-                    {{error, ErrInfo}, S}
-            end;
-        {response, _Mode, _Status, _Headers} ->
-            gun:cancel(Gun, Stream),
-            gun:flush(Stream),
-            {{error, enotdir}, S}
+
+        Err = {error, _} ->
+            {Err, S}
     end.
 
 read_file_info(Path, S = #state{}) ->
