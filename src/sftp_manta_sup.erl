@@ -48,9 +48,9 @@ start_link() ->
 %%                  type => worker(),       % optional
 %%                  modules => modules()}   % optional
 init([]) ->
-    SupFlags = #{strategy => one_for_all,
-        intensity => 0,
-        period => 1},
+    SupFlags = #{strategy => one_for_one,
+        intensity => 5,
+        period => 10},
     SFTPSpec = sftpd_manta:subsystem_spec([
         {file_handler, sftp_manta_app}
         ]),
@@ -69,7 +69,8 @@ init([]) ->
     ],
     ListenPort = application:get_env(sftp_manta, listen_port, 2222),
     ChildSpecs = [
-        #{id => sshd, start => {ssh, daemon, [ListenPort, SSHOpts]}}
+        #{id => sshd, start => {ssh, daemon, [ListenPort, SSHOpts]}},
+        #{id => auth, start => {sftp_manta_auth, start_link, []}}
     ],
     {ok, {SupFlags, ChildSpecs}}.
 

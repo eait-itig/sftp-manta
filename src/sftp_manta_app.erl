@@ -70,106 +70,11 @@ host_key('ecdsa-sha2-nistp256', _Opts) ->
 host_key(Alg, _Opts) ->
     {error, {no_key_for_alg, Alg}}.
 
-mahi_get_auth_user(User) ->
-    MahiHostInfo = application:get_env(sftp_manta, mahi, []),
-    MahiHost = proplists:get_value(host, MahiHostInfo),
-    MahiPort = proplists:get_value(port, MahiHostInfo, 80),
-    {ok, MahiGun} = gun:open(MahiHost, MahiPort),
-    {ok, _} = gun:await_up(MahiGun, 15000),
-    Qs = uri_string:compose_query([{"login", User}]),
-    Uri = iolist_to_binary(["/users?", Qs]),
-    InHdrs = [{<<"accept">>, <<"application/json">>}],
-    Stream = gun:get(MahiGun, Uri, InHdrs),
-    Ret = case gun:await(MahiGun, Stream, 10000) of
-        {response, nofin, Status, Headers} when (Status < 300) ->
-            Hdrs = maps:from_list(Headers),
-            #{<<"content-type">> := <<"application/json">>} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
-            #{<<"account">> := Account} = jsx:decode(Body, [return_maps]),
-            {ok, Account};
-        {response, nofin, Status, Headers} ->
-            Hdrs = maps:from_list(Headers),
-            #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 30000),
-            ErrInfo = case ContentType of
-                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
-                _ -> {http, Status, Body}
-            end,
-            {error, ErrInfo};
-        {response, fin, Status, _Headers} ->
-            {error, {http, Status}}
-    end,
-    gun:close(MahiGun),
-    Ret.
-
 is_auth_key(PubKey, User, _Opts) ->
-    HSKey = http_signature_key:from_record(PubKey),
-    Fp = http_signature_key:fingerprint(HSKey),
-    {ok, Mode} = application:get_env(sftp_manta, auth_mode),
-    case Mode of
-        operator ->
-            case application:get_env(sftp_manta, authorized_keys_file) of
-                {ok, Filename} ->
-                    {ok, Data} = file:read_file(Filename),
-                    Keys = public_key:ssh_decode(Data, auth_keys),
-                    Matching = [Attrs || {Key, Attrs} <- Keys, Key =:= PubKey],
-                    lists:any(fun (Attrs) ->
-                        Opts = proplists:get_value(options, Attrs, []),
-                        case Opts of
-                            [] -> true;
-                            _ -> lists:member("user=" ++ User, Opts)
-                        end
-                    end, Matching);
-                _ -> false
-            end;
-        mahi_plus_token ->
-            case mahi_get_auth_user(User) of
-                {ok, Account} ->
-                    #{<<"keys">> := Keys} = Account,
-                    case Keys of
-                        #{Fp := MahiPem} ->
-                            [Entry] = public_key:pem_decode(MahiPem),
-                            MahiPubKey = public_key:pem_entry_decode(Entry),
-                            case MahiPubKey of
-                                PubKey ->
-                                    lager:debug("authed ~p with key ~p", [User, Fp]),
-                                    true;
-                                _ ->
-                                    lager:warn("key ~p for user ~p matched fp, but not key!", [Fp, User]),
-                                    false
-                            end;
-                        _ -> false
-                    end;
-                {error, Err} ->
-                    lager:debug("mahi returned error looking up user '~s': ~p",
-                        [User, Err]),
-                    false
-            end
-    end.
+    sftp_manta_auth:is_auth_key(PubKey, User).
 
-validate_pw(User, Pw, _RemoteAddr, _State) ->
-    Krb5Config = application:get_env(sftp_manta, krb5, []),
-    case proplists:get_value(realm, Krb5Config) of
-        undefined ->
-            lager:debug("~p trying to use password auth", [User]),
-            false;
-        Realm ->
-            Opts = Krb5Config -- [{realm, Realm}],
-            {ok, KrbClient} = krb_client:open(Realm, Opts),
-            case krb_client:authenticate(KrbClient, User, Pw) of
-                ok ->
-                    case mahi_get_auth_user(User) of
-                        {ok, _Account} -> true;
-                        {error, Err} ->
-                            lager:warn("mahi rejected user ~p which krb5 "
-                                "accepted: ~p", [User, Err]),
-                            false
-                    end;
-                {error, Why} ->
-                    lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
-                    false
-            end
-    end.
+validate_pw(User, Pw, RemoteAddr, _State) ->
+    sftp_manta_auth:validate_pw(User, Pw, RemoteAddr).
 
 -record(state, {
     user,
