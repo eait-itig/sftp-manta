@@ -808,7 +808,7 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
                 {error, Why, S2} ->
                     {{error, Why}, S2}
             end;
-        {false, true} ->
+        {_, true} ->
             lager:debug("~p opening ~p for write (~p)", [S#state.user, Path, Flags]),
             {ok, Fsm} = case S of
                 #state{amode = operator, signer = Signer} ->
@@ -828,7 +828,7 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
             Cache2 = Cache#{PathBin => #{ts => Now, stat => fake_new_file_info(Path)}},
             S4 = S3#state{statcache = Cache2},
             {{ok, Fd}, S4};
-         _ ->
+        _ ->
             lager:debug("~p tried to open ~p with unsupported flags: ~p", [S#state.user,
                 Path, Flags]),
             {{error, eacces}, S}
