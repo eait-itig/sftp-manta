@@ -170,7 +170,7 @@ handle_call({is_auth_key, PubKey, User}, _From, S0 = #?MODULE{mahi = MahiGun})
                             lager:debug("authed ~p with key ~p", [User, Fp]),
                             {reply, true, S0};
                         _ ->
-                            lager:warn("key ~p for user ~p matched fp, but "
+                            lager:debug("key ~p for user ~p matched fp, but "
                                 "not key!", [Fp, User]),
                             {reply, false, S0}
                     end;
@@ -198,7 +198,7 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
                     {reply, false, S0}
             end;
         {error, Err} ->
-            lager:warn("mahi rejected user ~p: ~p", [User, Err]),
+            lager:debug("mahi rejected user ~p: ~p", [User, Err]),
             {reply, false, S0}
     end;
 
