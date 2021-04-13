@@ -340,7 +340,8 @@ scp_server_loop(Opts = #scp_opts{mode = sender, target = T, recursive = false},
             Snext = lists:foldl(fun ({Path, Sz}, SS0) ->
                 SS1 = scp_read_file(Opts, Path, Sz, SS0),
                 C ! {write, self(), <<0>>},
-                SS1
+                {<<0>>, SS2} = await_bytes(1, SS1),
+                SS2
             end, S0, Files),
             C ! {exit, self(), 0}
     end;
