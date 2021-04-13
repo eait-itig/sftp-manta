@@ -62,10 +62,15 @@ init([]) ->
         {preferred_algorithms, [
             {public_key, ['ecdsa-sha2-nistp256', 'rsa-sha2-512', 'rsa-sha2-256', 'ssh-rsa']}
         ]},
-	{recbuf, 128*1024},
-	{sndbuf, 128*1024},
-	{buffer, 256*1024},
-	{keepalive, true}
+        {recbuf, 128*1024},
+        {sndbuf, 128*1024},
+        {buffer, 256*1024},
+        {keepalive, true},
+        {max_sessions, 256},
+        {max_channels, 8},
+        {parallel_login, true},
+        {negotiation_timeout, 10000},
+        {hello_timeout, 5000}
     ],
     ListenPort = application:get_env(sftp_manta, listen_port, 2222),
     ChildSpecs = [
