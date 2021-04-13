@@ -69,8 +69,7 @@ init([]) ->
         {max_sessions, 256},
         {max_channels, 8},
         {parallel_login, true},
-        {negotiation_timeout, 10000},
-        {hello_timeout, 5000}
+        {negotiation_timeout, 10000}
     ],
     ListenPort = application:get_env(sftp_manta, listen_port, 2222),
     ChildSpecs = [
