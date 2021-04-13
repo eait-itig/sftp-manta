@@ -186,21 +186,27 @@ handle_call({is_auth_key, PubKey, User}, _From, S0 = #?MODULE{mahi = MahiGun})
 handle_call({is_auth_key, _PubKey, _User}, _From, S0 = #?MODULE{}) ->
     {reply, false, S0};
 
-
 handle_call({validate_pw, User, Pw, _Ip}, _From,
-                    S0 = #?MODULE{krb = Krb, mode = Mode}) when is_pid(Krb) ->
-    case krb_client:authenticate(Krb, User, Pw) of
-        ok when (Mode =:= operator) ->
-            {reply, true, S0};
-        ok when (Mode =:= mahi_plus_token) ->
-            case mahi_get_auth_user(User, S0) of
-                {ok, _Account} ->
+        S0 = #?MODULE{krb = Krb, mode = mahi_plus_token}) when is_pid(Krb) ->
+    case mahi_get_auth_user(User, S0) of
+        {ok, _Account} ->
+            case krb_client:authenticate(Krb, User, Pw) of
+                ok ->
                     {reply, true, S0};
-                {error, Err} ->
-                    lager:warn("mahi rejected user ~p which krb5 "
-                        "accepted: ~p", [User, Err]),
+                {error, Why} ->
+                    lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
                     {reply, false, S0}
             end;
+        {error, Err} ->
+            lager:warn("mahi rejected user ~p: ~p", [User, Err]),
+            {reply, false, S0}
+    end;
+
+handle_call({validate_pw, User, Pw, _Ip}, _From,
+                S0 = #?MODULE{krb = Krb, mode = operator}) when is_pid(Krb) ->
+    case krb_client:authenticate(Krb, User, Pw) of
+        ok ->
+            {reply, true, S0};
         {error, Why} ->
             lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
             {reply, false, S0}
