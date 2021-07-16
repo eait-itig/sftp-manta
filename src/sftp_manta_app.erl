@@ -32,6 +32,9 @@
 -include_lib("ssh/src/ssh_connect.hrl").
 -compile([{parse_transform, lager_transform}]).
 
+% this file is overloaded as hell
+% TODO: split these behaviours up into their own files
+%       (ideally their own gen_server/gen_statem)
 -behaviour(application).
 -behaviour(ssh_server_key_api).
 -behaviour(ssh_sftpd_file_api).
@@ -1095,5 +1098,3 @@ write_file_info(Path, _Info, S = #state{}) ->
         {ok, _, S2} -> {ok, S2};
         {error, Why, S2} -> {{error, Why}, S2}
     end.
-
-%% internal functions

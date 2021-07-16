@@ -25,6 +25,53 @@
 %% THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 %%
 
+%
+% The file_read_fsm converts any number of seek and fixed-size read operations
+% from an SFTP/SCP client into streaming HTTP GETs from Manta.
+%
+% Clients can read files sequentially, or seek around in the file. We try to
+% handle seeks ('position' messages) with HTTP range request where we can, but
+% otherwise will just dump bytes until we catch up, or restart the GET if we
+% need to handle a backwards seek.
+%
+% Since it's very common for clients to read slower than Manta is able to send
+% data to the bridge, this has to handle back-pressure on the client socket
+% effectively.
+%
+
+%  init
+%   │
+%   │
+%   ▼
+% ┌────────────┐  (http error)             ┌─────────┐         ┌───────┐
+% │disconnected│──────────────────────────►│ errored │         │ ended │
+% └─┬──────────┘                           └─────────┘         └───────┘
+%   │                                       ▲                      ▲
+%   │ connect                          http │   ┌──────────────────┘
+%   ▼                                   err │   │EOF
+% ┌───────────┐  read,                   ┌──┴───┴────┐
+% │           │  seek (ranged)           │           ├─────┐
+% │           ├────────────────────────► │           │     │ read (seq)
+% │           │                          │  flowing  │◄────┘
+% │   ready   │   backwards seek (ranged)│           │
+% │           │ ◄────────────────────────┤ (HTTP     ├─────┐
+% │           │                          │  reading) │     │ seek (in buf)
+% │           │          ┌───────────────┤           │◄────┘
+% └─────┬─────┘          │    buf hwm    └───────┬───┘
+%       │ seek           │                 ▲   ▲ │
+%       │ (no range)     │ ┌───────────────┘   │ │ seek
+%       ▼                │ │                   │ │(no range)
+%     (skipping)         │ │                   │ │
+%                        │ │          caught up│ ▼
+%     ┌──────────┐       │ │          ┌────────┴─────┐
+%     │          │◄──────┘ │          │              │
+%     │  corked  │         │          │   skipping   │
+%     │          ├─────────┘          │              │
+%     └─┬────────┘ buf lwm            └──────────────┘
+%       │
+%       ▼ same transitions
+%     ...  as flowing
+
 -module(file_read_fsm).
 
 -behaviour(gen_statem).

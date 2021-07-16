@@ -25,6 +25,51 @@
 %% THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 %%
 
+%
+% The file_write_fsm exists to convert a bunch of fixed-size write operations
+% from an SFTP/SCP client into a streaming HTTP PUT of a Manta object.
+%
+% Obviously, there are some cases which will be way too complicated for us to
+% handle (e.g. a client who writes a file backwards from the end). We do,
+% however try to handle a few common cases:
+%
+%  * A client who writes the file sequentially starting at offset 0
+%    (this is the simplest one to map into an HTTP PUT)
+%  * A client who skips to an offset in the file and writes sequentially
+%    forwards from there (to the end, or until some point and then closes)
+%
+% For the first case, we just have to keep waiting for more writes that match
+% the sequence and pushing them across into the open HTTP request.
+%
+% For the second case, we have to read-modify-write the object by starting a
+% file_read_fsm and writing some of the data from it, first, before we start
+% to push in the data from our client.
+%
+
+%  init
+%   │
+%   │
+%   ▼
+% ┌────────────┐  (http error)              ┌───────┐
+% │disconnected│──────────────────────────► │errored│
+% └─┬──────────┘                            └───────┘
+%   │                                          ▲
+%   │ connect                                  │
+%   ▼                                          │
+% ┌────────────┐  position                     │
+% │            │─────────► read_loop           │
+% │            │               │               │
+% │            │ ◄─────────────┘               │
+% │  flowing   │                               │
+% │            │──────┐                        │
+% │            │      │ write (seq)            │
+% │            │ ◄────┘                        │
+% └──────┬─────┘                               │
+%        │                                     │
+%        └─────────────────────────────────────┘
+%          write (out of seq)
+%          (http error)
+
 -module(file_write_fsm).
 
 -behaviour(gen_statem).
