@@ -79,43 +79,55 @@ is_auth_key(PubKey, User, _Opts) ->
 validate_pw(User, Pw, RemoteAddr, _State) ->
     sftp_manta_auth:validate_pw(User, Pw, RemoteAddr).
 
+-type msec_ts() :: integer().       % milliseconds since system epoch
+-type statcache_entry() ::
+    #{ts => msec_ts(), stat => #file_info{}} |
+    #{ts => msec_ts(), error => term()}.
+
+-record(fd_state, {path :: path(), fsm :: pid()}).
+
+-type path() :: string().
+-type fd() :: integer().
+
 -record(state, {
-    user,
-    amode,
-    cwd,
-    signer,
-    token,
-    gun,
-    mahi,
-    host,
-    port = 443,
-    statcache = #{},
-    fds = #{},
-    next_fd = 10,
-    peer
+    user :: string(),
+    amode :: operator | mahi_plus_token,
+    cwd :: string(),
+    signer :: undefined | pid(),    % http_signature_signer
+    token :: undefined | binary(),  % mahi auth token
+    gun :: undefined | pid(),       % manta gun for metadata ops
+    mahi :: undefined | pid(),      % mahi gun
+    host :: string(),               % manta hostname
+    port = 443 :: integer(),        % manta port
+    statcache = #{} :: #{path() => statcache_entry()},
+    fds = #{} :: #{fd() => #fd_state{}},
+    next_fd = 10 :: integer()
     }).
 
 -record(scp_opts, {
-    verbose = false,
-    recursive = false,
-    directory = false,
-    mode = receiver,
-    bad = false,
-    target
+    verbose = false :: boolean(),
+    recursive = false :: boolean(),
+    directory = false :: boolean(),
+    mode = receiver :: receiver | sender,
+    bad = false :: boolean(),
+    target :: binary()
 }).
 
 -record(scp_state, {
-    state = #state{},
-    buf = [],
-    hadeof = false,
-    pid,
-    srvpid,
-    cmd,
-    chan,
-    cm,
-    cwdstack = []
+    state = #state{} :: #state{},
+    buf = [] :: [binary()],
+    hadeof = false :: boolean(),
+    pid :: pid(),                   % interface pid
+    srvpid :: pid(),                % pid running scp_server_loop()
+    cmd :: string(),                % original cmdline requested
+    chan :: term(),                 % opaque ssh channel id
+    cm :: pid(),                    % ssh connection manager
+    cwdstack = [] :: [binary()]     % stack of working dirs during recursive
 }).
 
+%
+% SSH channel callbacks (used for SCP)
+%
 
 init(_) ->
     process_flag(trap_exit, true),
@@ -202,6 +214,10 @@ handle_ssh_msg({ssh_cm, CM, {eof, ChanId}}, S = #scp_state{cm = CM, pid = Me, sr
 
 handle_ssh_msg(_Msg, S = #scp_state{}) ->
     {ok, S}.
+
+%
+% Utilty functions for SCP server
+%
 
 parse_scp_opts(O, <<>>) -> O;
 parse_scp_opts(O, <<" ", Rem/binary>>) -> parse_scp_opts(O, Rem);
@@ -534,6 +550,10 @@ request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = mahi_plus_tok
     Hdrs2 = maps:to_list(Hdrs1),
     gun:request(Gun, Method, Url, Hdrs2).
 
+%
+% General SSH server callbacks (login etc)
+%
+
 login(User, S = #state{amode = operator}) ->
     lager:debug("sftpd starting for user ~p", [User]),
     {ok, KeyPath} = application:get_env(sftp_manta, auth_key_file),
@@ -621,6 +641,10 @@ logout(#state{mahi = undefined, gun = Gun, user = User}) ->
 logout(S = #state{mahi = MahiGun}) ->
     gun:close(MahiGun),
     logout(S#state{mahi = undefined}).
+
+%
+% SFTP server callbacks
+%
 
 get_cwd([]) ->
     MantaHostInfo = application:get_env(sftp_manta, manta, []),
@@ -952,8 +976,6 @@ make_dir(Path, S = #state{gun = Gun}) ->
      
 make_symlink(_Path2, _Path, S = #state{}) ->
     {{error, enotsup}, S}.
-
--record(fd_state, {path, fsm}).
 
 open(Path, Flags, S = #state{host = Host, port = Port}) ->
     case {lists:member(read, Flags), lists:member(write, Flags)} of
