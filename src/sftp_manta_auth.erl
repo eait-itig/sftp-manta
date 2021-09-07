@@ -58,13 +58,11 @@ validate_pw(User, Pw, RemoteAddr) ->
 init([]) ->
     {ok, Mode} = application:get_env(sftp_manta, auth_mode),
     S0 = #?MODULE{mode = Mode},
-    Krb5Config = application:get_env(sftp_manta, krb5, []),
-    S1 = case proplists:get_value(realm, Krb5Config) of
-        undefined ->
-            S0;
-        Realm ->
-            Opts = Krb5Config -- [{realm, Realm}],
-            {ok, KrbClient} = krb_client:open(Realm, Opts),
+    Krb5Realm = application:get_env(sftp_manta, krb5_realm),
+    S1 = case Krb5Realm of
+        undefined -> S0;
+        _ ->
+            {ok, KrbClient} = krb_realm:open(Krb5Realm),
             KrbMRef = monitor(process, KrbClient),
             S0#?MODULE{krb = KrbClient, krbmon = KrbMRef}
     end,
@@ -190,7 +188,7 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
         S0 = #?MODULE{krb = Krb, mode = mahi_plus_token}) when is_pid(Krb) ->
     case mahi_get_auth_user(User, S0) of
         {ok, _Account} ->
-            case krb_client:authenticate(Krb, User, Pw) of
+            case krb_realm:authenticate(Krb, User, Pw) of
                 ok ->
                     lager:debug("authed ~p with password", [User]),
                     {reply, true, S0};
@@ -205,7 +203,7 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
 
 handle_call({validate_pw, User, Pw, _Ip}, _From,
                 S0 = #?MODULE{krb = Krb, mode = operator}) when is_pid(Krb) ->
-    case krb_client:authenticate(Krb, User, Pw) of
+    case krb_realm:authenticate(Krb, User, Pw) of
         ok ->
             {reply, true, S0};
         {error, Why} ->
@@ -219,10 +217,8 @@ handle_call({validate_pw, _User, _Pw, _Ip}, _From, S0 = #?MODULE{}) ->
 
 handle_info({'DOWN', MRef, process, _Pid, Why}, S0 = #?MODULE{krbmon = MRef}) ->
     lager:debug("krb client died with: ~p", [Why]),
-    Krb5Config = application:get_env(sftp_manta, krb5, []),
-    Realm = proplists:get_value(realm, Krb5Config),
-    Opts = Krb5Config -- [{realm, Realm}],
-    {ok, KrbClient} = krb_client:open(Realm, Opts),
+    Krb5Realm = application:get_env(sftp_manta, krb5_realm),
+    {ok, KrbClient} = krb_realm:open(Krb5Realm),
     KrbMRef = monitor(process, KrbClient),
     S1 = S0#?MODULE{krb = KrbClient, krbmon = KrbMRef},
     {noreply, S1};

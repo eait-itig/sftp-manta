@@ -7,8 +7,11 @@
 		%% Port to listen for SFTP connections on
 		{listen_port, 2222},
 
-		%% SSH host key (must be ECDSA at the moment)
+		%% SSH hostkeys -- you can generate these with ssh-keygen
+		%% ECDSA
 		{host_key_file, "config/hostkey_ecdsa"},
+		%% RSA
+		{rsa_host_key_file, "config/hostkey_rsa"},
 
 		%% Details for the Manta we want to connect to
 		{manta, [
@@ -60,12 +63,48 @@
 		%% If you want password auth support (it's optional), we can
 		%% check passwords against a KRB5 realm.
 		%%
-		%{krb5, [
-		%	{realm, "KRB5.EXAMPLE.COM"},
-		%	%{kdc, ["kdc1.domain"]},
-		%	%{ciphers, [aes256_hmac_sha1, aes128_hmac_sha1, rc4_hmac]},
-		%	{timeout, 2000}
-		%]}
+		%{krb5_realm, "KRB5.EXAMPLE.COM"}
+	]},
+	%%
+	%% If using KRB5 password auth above, you can configure/override
+	%% settings for the Kerberos realm here.
+	%%
+	%% Kerlberos also parses /etc/krb5.conf, so settings specified there
+	%% are used (anything you place here overrides that).
+	%%
+	%% see https://hexdocs.pm/kerlberos/krb_realm_conf.html#type-config_list
+	%%
+	{kerlberos, [
+		{realms, [
+			%%
+			%% Defaults for any realm
+			%%
+			{default, [
+				%% Ignore KDCs in DNS
+				%{use_dns, false},
+
+				%% Use specific etypes/ciphers
+				%% (not normally required)
+				%{ciphers, [aes256_hmac_sha384, aes128_hmac_sha256]},
+
+				%% Set the initial timeout and retry limit
+				%{timeout, 1000},
+				%{retries, 3}
+			]},
+
+			%%
+			%% Realm-specific configuration
+			%%
+			{"KRB5.EXAMPLE.COM", [
+				%% Provide a list of KDCs
+				%{kdc, ["kdc1.example.com", "kdc2.example.com"]},
+
+				%% Ignore KDCs in DNS
+				%{use_dns, false},
+
+				%% Anything valid in {default, []} is valid here
+			]}
+		]}
 	]},
 	{lager, [
 		{log_root, "/var/log/sftp_manta"},
