@@ -263,7 +263,7 @@ await_bytes(N, S = #scp_state{buf = [Chunk0 | B1]}) ->
         (N == byte_size(Chunk0)) ->
             {Chunk0, S#scp_state{buf = B1}};
         (N > byte_size(Chunk0)) ->
-            {Rest, S2} = await_bytes(N, S#scp_state{buf = B1}),
+            {Rest, S2} = await_bytes(N - byte_size(Chunk0), S#scp_state{buf = B1}),
             {<<Chunk0/binary, Rest/binary>>, S2}
     end;
 await_bytes(N, S = #scp_state{pid = C, buf = []}) ->
