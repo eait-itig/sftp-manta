@@ -619,8 +619,8 @@ login(User, S = #state{amode = mahi_plus_token}) ->
             TokenKey = proplists:get_value(key, TokenConfig),
             TokenIV = proplists:get_value(iv, TokenConfig),
 
-            TokenEnc = crypto:block_encrypt(aes_cbc128, <<TokenKey:128/big>>,
-                <<TokenIV:128/big>>, TokenPadded),
+            TokenEnc = crypto:crypto_one_time(aes_128_cbc, <<TokenKey:128/big>>,
+                <<TokenIV:128/big>>, TokenPadded, true),
             Token = base64:encode(TokenEnc),
 
             {ok, Gun} = gun:open(S#state.host, S#state.port, #{
