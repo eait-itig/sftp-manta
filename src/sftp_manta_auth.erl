@@ -190,7 +190,7 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
     case mahi_get_auth_user(User, S0) of
         {ok, _Account} ->
             case krb_realm:authenticate(Krb, [User], PwBin) of
-                ok ->
+                {ok, _Ticket} ->
                     lager:debug("authed ~p with password", [User]),
                     {reply, true, S0};
                 {error, Why} ->
@@ -206,7 +206,7 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
                 S0 = #?MODULE{krb = Krb, mode = operator}) when is_pid(Krb) ->
     PwBin = iolist_to_binary([Pw]),
     case krb_realm:authenticate(Krb, [User], PwBin) of
-        ok ->
+        {ok, _Ticket} ->
             {reply, true, S0};
         {error, Why} ->
             lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
