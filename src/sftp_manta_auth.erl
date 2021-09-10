@@ -186,9 +186,10 @@ handle_call({is_auth_key, _PubKey, _User}, _From, S0 = #?MODULE{}) ->
 
 handle_call({validate_pw, User, Pw, _Ip}, _From,
         S0 = #?MODULE{krb = Krb, mode = mahi_plus_token}) when is_pid(Krb) ->
+    PwBin = iolist_to_binary([Pw]),
     case mahi_get_auth_user(User, S0) of
         {ok, _Account} ->
-            case krb_realm:authenticate(Krb, User, Pw) of
+            case krb_realm:authenticate(Krb, [User], PwBin) of
                 ok ->
                     lager:debug("authed ~p with password", [User]),
                     {reply, true, S0};
@@ -203,7 +204,8 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
 
 handle_call({validate_pw, User, Pw, _Ip}, _From,
                 S0 = #?MODULE{krb = Krb, mode = operator}) when is_pid(Krb) ->
-    case krb_realm:authenticate(Krb, User, Pw) of
+    PwBin = iolist_to_binary([Pw]),
+    case krb_realm:authenticate(Krb, [User], PwBin) of
         ok ->
             {reply, true, S0};
         {error, Why} ->
