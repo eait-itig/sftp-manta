@@ -319,6 +319,15 @@ scp_server_loop(Opts = #scp_opts{mode = sender, target = T, recursive = false},
     TStr = unicode:characters_to_list(T, utf8),
     {compiled_wildcard, Patt} = filelib:compile_wildcard(TStr),
     {Files, S1} = case Patt of
+        {{exists, [$/ | Path]}, 0} ->
+            #state{user = U} = St0,
+            N = iolist_to_binary([$/, Path]),
+            case get_stat(N, St0) of
+                {ok, #file_info{size = Sz}, St1} ->
+                    {[{N, Sz}], S0#scp_state{state = St1}};
+                _ ->
+                    {[], S0}
+            end;
         {{exists, [$., $/ | File]}, 2} ->
             #state{user = U} = St0,
             N = iolist_to_binary([$/, U, "/stor/", File]),
