@@ -58,7 +58,7 @@ validate_pw(User, Pw, RemoteAddr) ->
 init([]) ->
     {ok, Mode} = application:get_env(sftp_manta, auth_mode),
     S0 = #?MODULE{mode = Mode},
-    Krb5Realm = application:get_env(sftp_manta, krb5_realm),
+    Krb5Realm = application:get_env(sftp_manta, krb5_realm, undefined),
     S1 = case Krb5Realm of
         undefined -> S0;
         _ ->
@@ -217,7 +217,7 @@ handle_call({validate_pw, _User, _Pw, _Ip}, _From, S0 = #?MODULE{}) ->
 
 handle_info({'DOWN', MRef, process, _Pid, Why}, S0 = #?MODULE{krbmon = MRef}) ->
     lager:debug("krb client died with: ~p", [Why]),
-    Krb5Realm = application:get_env(sftp_manta, krb5_realm),
+    Krb5Realm = application:get_env(sftp_manta, krb5_realm, undefined),
     {ok, KrbClient} = krb_realm:open(Krb5Realm),
     KrbMRef = monitor(process, KrbClient),
     S1 = S0#?MODULE{krb = KrbClient, krbmon = KrbMRef},
