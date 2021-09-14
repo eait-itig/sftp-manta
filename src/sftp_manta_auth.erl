@@ -34,6 +34,7 @@
 -compile([{parse_transform, lager_transform}]).
 
 -export([start_link/0, is_auth_key/2, validate_pw/3]).
+-export([mahi_get_auth_user/2, mahi_get_auth_user/3]).
 -export([init/1, terminate/2, handle_call/3, handle_info/2]).
 
 start_link() ->
@@ -114,7 +115,33 @@ check_update_keys(S0 = #?MODULE{keymtime = OldMTime}) ->
             S0
     end.
 
-mahi_get_auth_user(User, S0 = #?MODULE{mahi = MahiGun}) ->
+mahi_get_auth_user(User, Account, MahiGun) ->
+    Qs = uri_string:compose_query([{"login", User}, {"account", Account}]),
+    Uri = iolist_to_binary(["/users?", Qs]),
+    InHdrs = [{<<"accept">>, <<"application/json">>}],
+    Stream = gun:get(MahiGun, Uri, InHdrs),
+    case gun:await(MahiGun, Stream, 30000) of
+        {response, nofin, Status, Headers} when (Status < 300) ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := <<"application/json">>} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
+            #{<<"account">> := Account, <<"user">> := User,
+                <<"roles">> := Roles} = jsx:decode(Body, [return_maps]),
+            {ok, Account, User, Roles};
+        {response, nofin, Status, Headers} ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 30000),
+            ErrInfo = case ContentType of
+                <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
+                _ -> {http, Status, Body}
+            end,
+            {error, ErrInfo};
+        {response, fin, Status, _Headers} ->
+            {error, {http, Status}}
+    end.
+
+mahi_get_auth_user(User, MahiGun) ->
     Qs = uri_string:compose_query([{"login", User}]),
     Uri = iolist_to_binary(["/users?", Qs]),
     InHdrs = [{<<"accept">>, <<"application/json">>}],
@@ -124,8 +151,9 @@ mahi_get_auth_user(User, S0 = #?MODULE{mahi = MahiGun}) ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := <<"application/json">>} = Hdrs,
             {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
-            #{<<"account">> := Account} = jsx:decode(Body, [return_maps]),
-            {ok, Account};
+            #{<<"account">> := Account, <<"roles">> := Roles} =
+                jsx:decode(Body, [return_maps]),
+            {ok, Account, Roles};
         {response, nofin, Status, Headers} ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
@@ -156,9 +184,33 @@ handle_call({is_auth_key, PubKey, User}, _From, S0 = #?MODULE{mahi = MahiGun})
                                                         when is_pid(MahiGun) ->
     HSKey = http_signature_key:from_record(PubKey),
     Fp = http_signature_key:fingerprint(HSKey),
-    case mahi_get_auth_user(User, S0) of
-        {ok, Account} ->
+    MahiRes = case binary:split(iolist_to_binary([User]), [<<"@">>]) of
+        [SubuserName, AccountName] ->
+            mahi_get_auth_user(SubuserName, AccountName, MahiGun);
+        [Username] ->
+            mahi_get_auth_user(User, MahiGun)
+    end,
+    case MahiRes of
+        {ok, Account, _Roles} ->
             #{<<"keys">> := Keys} = Account,
+            case Keys of
+                #{Fp := MahiPem} ->
+                    [Entry] = public_key:pem_decode(MahiPem),
+                    MahiPubKey = public_key:pem_entry_decode(Entry),
+                    case MahiPubKey of
+                        PubKey ->
+                            lager:debug("authed ~p with key ~p", [User, Fp]),
+                            {reply, true, S0};
+                        _ ->
+                            lager:debug("key ~p for user ~p matched fp, but "
+                                "not key!", [Fp, User]),
+                            {reply, false, S0}
+                    end;
+                _ ->
+                    {reply, false, S0}
+            end;
+        {ok, _Account, Subuser, _Roles} ->
+            #{<<"keys">> := Keys} = Subuser,
             case Keys of
                 #{Fp := MahiPem} ->
                     [Entry] = public_key:pem_decode(MahiPem),
@@ -187,8 +239,8 @@ handle_call({is_auth_key, _PubKey, _User}, _From, S0 = #?MODULE{}) ->
 handle_call({validate_pw, User, Pw, _Ip}, _From,
         S0 = #?MODULE{krb = Krb, mode = mahi_plus_token}) when is_pid(Krb) ->
     PwBin = iolist_to_binary([Pw]),
-    case mahi_get_auth_user(User, S0) of
-        {ok, _Account} ->
+    case mahi_get_auth_user(User, S0#?MODULE.mahi) of
+        {ok, _Account, _Roles} ->
             case krb_realm:authenticate(Krb, [User], PwBin) of
                 {ok, _Ticket} ->
                     lager:debug("authed ~p with password", [User]),

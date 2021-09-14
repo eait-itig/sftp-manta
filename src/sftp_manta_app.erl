@@ -589,23 +589,22 @@ login(User, S = #state{amode = mahi_plus_token}) ->
     MahiPort = proplists:get_value(port, MahiHostInfo, 80),
     {ok, MahiGun} = gun:open(MahiHost, MahiPort),
     {ok, _} = gun:await_up(MahiGun, 15000),
-    Qs = uri_string:compose_query([{"login", User}]),
-    Uri = iolist_to_binary(["/accounts?", Qs]),
-    InHdrs = [{<<"accept">>, <<"application/json">>}],
-    Stream = gun:get(MahiGun, Uri, InHdrs),
-    case gun:await(MahiGun, Stream, 10000) of
-        {response, nofin, Status, Headers} when (Status < 300) ->
-            Hdrs = maps:from_list(Headers),
-            #{<<"content-type">> := <<"application/json">>} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
-            #{<<"account">> := Account, <<"roles">> := Roles} =
-                jsx:decode(Body, [return_maps]),
+    MahiRes = case binary:split(iolist_to_binary([User]), [<<"@">>]) of
+        [SubuserName, AccountName] ->
+            sftp_manta_auth:mahi_get_auth_user(SubuserName, AccountName,
+                MahiGun);
+        [Username] ->
+            sftp_manta_auth:mahi_get_auth_user(Username, MahiGun)
+    end,
+    TokenJson = case MahiRes of
+        {ok, Account, Roles} ->
             #{<<"uuid">> := Uuid} = Account,
             DefaultRoles = case Account of
                 #{<<"defaultRoles">> := D} -> D;
                 _ -> []
             end,
-            TokenJson = jsx:encode(#{
+            SubuserJson = null,
+            jsx:encode(#{
                 <<"v">> => 2,
                 <<"p">> => #{
                     <<"account">> => #{
@@ -618,31 +617,57 @@ login(User, S = #state{amode = mahi_plus_token}) ->
                     <<"activeRoles">> => DefaultRoles
                 },
                 <<"t">> => erlang:system_time(millisecond)
-            }),
-            TokenGzip = zlib:gzip(TokenJson),
-            PadLen = 16 - (byte_size(TokenGzip) rem 16),
-            Padding = << <<PadLen:8>> || _ <- lists:seq(1, PadLen) >>,
-            TokenPadded = <<TokenGzip/binary, Padding/binary>>,
+            });
+        {ok, Account, Subuser, Roles} ->
+            #{<<"uuid">> := AcctUuid} = Account,
+            #{<<"uuid">> := SubUuid} = Subuser,
+            DefaultRoles = case Subuser of
+                #{<<"defaultRoles">> := D} -> D;
+                _ -> []
+            end,
+            jsx:encode(#{
+                <<"v">> => 2,
+                <<"p">> => #{
+                    <<"account">> => #{
+                        <<"uuid">> => AcctUuid
+                    },
+                    <<"user">> => #{
+                        <<"uuid">> => SubUuid
+                    },
+                    <<"roles">> => Roles
+                },
+                <<"c">> => #{
+                    <<"activeRoles">> => DefaultRoles
+                },
+                <<"t">> => erlang:system_time(millisecond)
+            });
+        Err = {error, Why} ->
+            lager:error("login failed for ~s: ~p", [User, Why]),
+            error(Why)
+    end,
+    TokenGzip = zlib:gzip(TokenJson),
+    PadLen = 16 - (byte_size(TokenGzip) rem 16),
+    Padding = << <<PadLen:8>> || _ <- lists:seq(1, PadLen) >>,
+    TokenPadded = <<TokenGzip/binary, Padding/binary>>,
 
-            TokenConfig = application:get_env(sftp_manta, token_auth, []),
-            TokenKey = proplists:get_value(key, TokenConfig),
-            TokenIV = proplists:get_value(iv, TokenConfig),
+    TokenConfig = application:get_env(sftp_manta, token_auth, []),
+    TokenKey = proplists:get_value(key, TokenConfig),
+    TokenIV = proplists:get_value(iv, TokenConfig),
 
-            TokenEnc = crypto:crypto_one_time(aes_128_cbc, <<TokenKey:128/big>>,
-                <<TokenIV:128/big>>, TokenPadded, true),
-            Token = base64:encode(TokenEnc),
+    TokenEnc = crypto:crypto_one_time(aes_128_cbc, <<TokenKey:128/big>>,
+        <<TokenIV:128/big>>, TokenPadded, true),
+    Token = base64:encode(TokenEnc),
 
-            {ok, Gun} = gun:open(S#state.host, S#state.port, #{
-                transport_opts => [
-                    {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
-                    {keepalive, true}
-                ],
-                retry => 0
-            }),
-            {ok, _} = gun:await_up(Gun, 30000),
+    {ok, Gun} = gun:open(S#state.host, S#state.port, #{
+        transport_opts => [
+            {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
+            {keepalive, true}
+        ],
+        retry => 0
+    }),
+    {ok, _} = gun:await_up(Gun, 30000),
 
-            S#state{user = User, mahi = MahiGun, gun = Gun, token = Token}
-    end.
+    S#state{user = User, mahi = MahiGun, gun = Gun, token = Token}.
 
 logout(#state{mahi = undefined, gun = Gun, user = User}) ->
     lager:debug("~p closed connection", [User]),
