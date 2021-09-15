@@ -125,9 +125,9 @@ mahi_get_auth_user(User, Account, MahiGun) ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := <<"application/json">>} = Hdrs,
             {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
-            #{<<"account">> := Account, <<"user">> := User,
+            #{<<"account">> := AccountObj, <<"user">> := UserObj,
                 <<"roles">> := Roles} = jsx:decode(Body, [return_maps]),
-            {ok, Account, User, Roles};
+            {ok, AccountObj, UserObj, Roles};
         {response, nofin, Status, Headers} ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
