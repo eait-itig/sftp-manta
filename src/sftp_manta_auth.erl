@@ -252,6 +252,9 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
         {ok, _Account, Subuser = #{<<"login">> := <<"anonymous">>}, _Roles} ->
             lager:debug("accepted anonymous subuser ~p", [User]),
             {reply, true, S0};
+        {ok, _Account, _Subuser, _Roles} ->
+            lager:debug("rejecting password auth for subuser ~p", [User]),
+            {reply, false, S0};
         {ok, _Account, _Roles} ->
             case krb_realm:authenticate(Krb, [User], PwBin) of
                 {ok, _Ticket} ->
