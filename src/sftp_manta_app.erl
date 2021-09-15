@@ -1047,18 +1047,26 @@ open(Path, Flags, S = #state{host = Host, port = Port}) ->
                 #state{amode = mahi_plus_token, token = Token} ->
                     file_write_fsm:start_link({Host, Port}, path_to_uri(Path), token, Token)
             end,
-            ok = gen_statem:call(Fsm, connect),
-            Fd = S#state.next_fd,
-            S2 = S#state{next_fd = Fd + 1},
-            FdMap = S2#state.fds,
-            FS = #fd_state{path = Path, fsm = Fsm},
-            S3 = S2#state{fds = FdMap#{Fd => FS}},
-            Cache = S3#state.statcache,
-            Now = erlang:system_time(millisecond),
-            PathBin = unicode:characters_to_binary(Path, utf8),
-            Cache2 = Cache#{PathBin => #{ts => Now, stat => fake_new_file_info(Path)}},
-            S4 = S3#state{statcache = Cache2},
-            {{ok, Fd}, S4};
+            case gen_statem:call(Fsm, connect) of
+                ok ->
+                    Fd = S#state.next_fd,
+                    S2 = S#state{next_fd = Fd + 1},
+                    FdMap = S2#state.fds,
+                    FS = #fd_state{path = Path, fsm = Fsm},
+                    S3 = S2#state{fds = FdMap#{Fd => FS}},
+                    Cache = S3#state.statcache,
+                    Now = erlang:system_time(millisecond),
+                    PathBin = unicode:characters_to_binary(Path, utf8),
+                    Cache2 = Cache#{PathBin => #{ts => Now, stat => fake_new_file_info(Path)}},
+                    S4 = S3#state{statcache = Cache2},
+                    {{ok, Fd}, S4};
+                {error, {http, 403, _}} ->
+                    {{error, eacces}, S};
+                {error, {http, 404, _}} ->
+                    {{error, enoent}, S};
+                {error, _} ->
+                    {{error, einval}, S}
+            end;
         _ ->
             lager:debug("~p tried to open ~p with unsupported flags: ~p", [S#state.user,
                 Path, Flags]),
