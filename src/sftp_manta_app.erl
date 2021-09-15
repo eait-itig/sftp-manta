@@ -594,6 +594,7 @@ login(User, S = #state{amode = mahi_plus_token}) ->
             sftp_manta_auth:mahi_get_auth_user(SubuserName, AccountName,
                 MahiGun);
         [Username] ->
+            AccountName = Username,
             sftp_manta_auth:mahi_get_auth_user(Username, MahiGun)
     end,
     TokenJson = case MahiRes of
@@ -667,7 +668,7 @@ login(User, S = #state{amode = mahi_plus_token}) ->
     }),
     {ok, _} = gun:await_up(Gun, 30000),
 
-    S#state{user = User, mahi = MahiGun, gun = Gun, token = Token}.
+    S#state{user = AccountName, mahi = MahiGun, gun = Gun, token = Token}.
 
 logout(#state{mahi = undefined, gun = Gun, user = User}) ->
     lager:debug("~p closed connection", [User]),
