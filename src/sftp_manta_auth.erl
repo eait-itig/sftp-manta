@@ -209,6 +209,9 @@ handle_call({is_auth_key, PubKey, User}, _From, S0 = #?MODULE{mahi = MahiGun})
                 _ ->
                     {reply, false, S0}
             end;
+        {ok, _Account, Subuser = #{<<"login">> := <<"anonymous">>}, _Roles} ->
+            lager:debug("accepted anonymous subuser ~p", [User]),
+            {reply, true, S0};
         {ok, _Account, Subuser, _Roles} ->
             #{<<"keys">> := Keys} = Subuser,
             case Keys of
@@ -239,7 +242,16 @@ handle_call({is_auth_key, _PubKey, _User}, _From, S0 = #?MODULE{}) ->
 handle_call({validate_pw, User, Pw, _Ip}, _From,
         S0 = #?MODULE{krb = Krb, mode = mahi_plus_token}) when is_pid(Krb) ->
     PwBin = iolist_to_binary([Pw]),
-    case mahi_get_auth_user(User, S0#?MODULE.mahi) of
+    MahiRes = case binary:split(iolist_to_binary([User]), [<<"@">>]) of
+        [SubuserName, AccountName] ->
+            mahi_get_auth_user(SubuserName, AccountName, S0#?MODULE.mahi);
+        [Username] ->
+            mahi_get_auth_user(User, S0#?MODULE.mahi)
+    end,
+    case MahiRes of
+        {ok, _Account, Subuser = #{<<"login">> := <<"anonymous">>}, _Roles} ->
+            lager:debug("accepted anonymous subuser ~p", [User]),
+            {reply, true, S0};
         {ok, _Account, _Roles} ->
             case krb_realm:authenticate(Krb, [User], PwBin) of
                 {ok, _Ticket} ->
