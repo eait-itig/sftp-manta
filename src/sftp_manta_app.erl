@@ -668,7 +668,10 @@ login(User, S = #state{amode = mahi_plus_token}) ->
     }),
     {ok, _} = gun:await_up(Gun, 30000),
 
-    S#state{user = AccountName, mahi = MahiGun, gun = Gun, token = Token}.
+    S#state{user = unicode:characters_to_list(AccountName, utf8),
+            mahi = MahiGun,
+            gun = Gun,
+            token = Token}.
 
 logout(#state{mahi = undefined, gun = Gun, user = User}) ->
     lager:debug("~p closed connection", [User]),
