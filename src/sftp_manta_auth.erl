@@ -85,7 +85,7 @@ init([]) ->
 terminate(Why, S0 = #?MODULE{mahi = MahiGun}) when is_pid(MahiGun) ->
     gun:close(MahiGun),
     terminate(Why, S0#?MODULE{mahi = undefined});
-terminate(Why, S0 = #?MODULE{}) ->
+terminate(Why, #?MODULE{}) ->
     lager:debug("auth process dying: ~p", [Why]),
     ok.
 
@@ -187,12 +187,11 @@ handle_call({is_auth_key, PubKey, User}, _From, S0 = #?MODULE{mahi = MahiGun})
     MahiRes = case binary:split(iolist_to_binary([User]), [<<"@">>]) of
         [SubuserName, AccountName] ->
             mahi_get_auth_user(SubuserName, AccountName, MahiGun);
-        [Username] ->
+        [_Username] ->
             mahi_get_auth_user(User, MahiGun)
     end,
     case MahiRes of
-        {ok, Account, _Roles} ->
-            #{<<"keys">> := Keys} = Account,
+        {ok, #{<<"keys">> := Keys}, _Roles} ->
             case Keys of
                 #{Fp := MahiPem} ->
                     [Entry] = public_key:pem_decode(MahiPem),
@@ -209,11 +208,13 @@ handle_call({is_auth_key, PubKey, User}, _From, S0 = #?MODULE{mahi = MahiGun})
                 _ ->
                     {reply, false, S0}
             end;
-        {ok, _Account, Subuser = #{<<"login">> := <<"anonymous">>}, _Roles} ->
+        {ok, _Account, _Roles} ->
+            % account has no keys
+            {reply, false, S0};
+        {ok, _Account, #{<<"login">> := <<"anonymous">>}, _Roles} ->
             lager:debug("accepted anonymous subuser ~p", [User]),
             {reply, true, S0};
-        {ok, _Account, Subuser, _Roles} ->
-            #{<<"keys">> := Keys} = Subuser,
+        {ok, _Account, #{<<"keys">> := Keys}, _Roles} ->
             case Keys of
                 #{Fp := MahiPem} ->
                     [Entry] = public_key:pem_decode(MahiPem),
@@ -230,6 +231,9 @@ handle_call({is_auth_key, PubKey, User}, _From, S0 = #?MODULE{mahi = MahiGun})
                 _ ->
                     {reply, false, S0}
             end;
+        {ok, _Account, _Subuser, _Roles} ->
+            % subuser has no keys
+            {reply, false, S0};
         {error, Err} ->
             lager:debug("mahi returned error looking up user '~s': ~p",
                 [User, Err]),
@@ -245,11 +249,11 @@ handle_call({validate_pw, User, Pw, _Ip}, _From,
     MahiRes = case binary:split(iolist_to_binary([User]), [<<"@">>]) of
         [SubuserName, AccountName] ->
             mahi_get_auth_user(SubuserName, AccountName, S0#?MODULE.mahi);
-        [Username] ->
+        [_Username] ->
             mahi_get_auth_user(User, S0#?MODULE.mahi)
     end,
     case MahiRes of
-        {ok, _Account, Subuser = #{<<"login">> := <<"anonymous">>}, _Roles} ->
+        {ok, _Account, #{<<"login">> := <<"anonymous">>}, _Roles} ->
             lager:debug("accepted anonymous subuser ~p", [User]),
             {reply, true, S0};
         {ok, _Account, _Subuser, _Roles} ->
