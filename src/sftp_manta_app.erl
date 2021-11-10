@@ -73,9 +73,11 @@ host_key('ecdsa-sha2-nistp256', _Opts) ->
 host_key(Alg, _Opts) ->
     {error, {no_key_for_alg, Alg}}.
 
+-spec is_auth_key(any(), string(), any()) -> boolean().
 is_auth_key(PubKey, User, _Opts) ->
     sftp_manta_auth:is_auth_key(PubKey, User).
 
+-spec validate_pw(string(), string() | pubkey, {inet:ip_address(), integer()}, any()) -> boolean() | disconnect | {boolean(), any()}.
 validate_pw(User, Pw, RemoteAddr, _State) ->
     sftp_manta_auth:validate_pw(User, Pw, RemoteAddr).
 
@@ -378,8 +380,8 @@ scp_server_loop(Opts = #scp_opts{mode = sender, target = T},
     lager:debug("TODO: implement sender mode"),
     C ! {write, self(), <<2, "scp source mode not implemented\n">>},
     C ! {exit, self(), 1};
-scp_server_loop(Opts = #scp_opts{mode = receiver, target = <<".">>},
-        S0 = #scp_state{pid = C}) ->
+scp_server_loop(Opts = #scp_opts{mode = receiver, target = <<".">>,
+        directory = IsDir}, S0 = #scp_state{pid = C}) ->
     C ! {write, self(), <<0>>},
     {L, S1} = await_line(S0),
     SS = S1#scp_state.state,
@@ -390,13 +392,25 @@ scp_server_loop(Opts = #scp_opts{mode = receiver, target = <<".">>},
             [LenBin, PathBin] = binary:split(Rest0, [<<" ">>]),
             Mode = binary_to_integer(ModeBin, 8),
             Len = binary_to_integer(LenBin),
-            lager:debug("scp writing file ~p (~p bytes)", [PathBin, Len]),
             C ! {write, self(), <<0>>},
-            Path = SS#state.cwd ++ "/" ++
-                unicode:characters_to_list(PathBin, utf8),
-            S2 = scp_write_file(Opts, Path, Len, S1),
-            {<<0>>, S3} = await_bytes(1, S2),
-            S3;
+            {Path, S2} = case get_stat(SS#state.cwd, SS) of
+                {_, _, SS1} when IsDir ->
+                    {SS#state.cwd ++ "/" ++
+                     unicode:characters_to_list(PathBin, utf8),
+                     S1#scp_state{state = SS1}};
+                {ok, #file_info{type = directory}, SS1} ->
+                    {SS#state.cwd ++ "/" ++
+                     unicode:characters_to_list(PathBin, utf8),
+                     S1#scp_state{state = SS1}};
+                {ok, _, SS1} ->
+                    {SS#state.cwd, S1#scp_state{state = SS1}};
+                {error, _, SS1} ->
+                    {SS#state.cwd, S1#scp_state{state = SS1}}
+            end,
+            lager:debug("scp writing file ~p (~p bytes)", [Path, Len]),
+            S3 = scp_write_file(Opts, Path, Len, S2),
+            {<<0>>, S4} = await_bytes(1, S3),
+            S4;
         <<"D", _/binary>> when Opts#scp_opts.recursive ->
             [<<"D", ModeBin:4/binary>>, Rest0] = binary:split(L, [<<" ">>]),
             [LenBin, PathBin] = binary:split(Rest0, [<<" ">>]),
@@ -465,7 +479,19 @@ scp_write_file(Opts = #scp_opts{}, Path, Len, SC0 = #scp_state{state = S0, pid =
             exit(normal)
     end,
     SC1 = scp_write_next_chunk(Opts, Fsm, Len, SC0),
-    ok = gen_statem:call(Fsm, close),
+    case gen_statem:call(Fsm, close) of
+        ok -> ok;
+        {error, {http, _, #{<<"code">> := CodeF, <<"message">> := MsgF}}} ->
+            ErrBinF = iolist_to_binary(io_lib:format("~p: ~s\n", [CodeF, MsgF])),
+            C ! {write, self(), <<2, " ", ErrBinF/binary>>},
+            C ! {exit, self(), 3},
+            exit(normal);
+        {error, ErrF} ->
+            ErrBinF = iolist_to_binary(io_lib:format("~999p\n", [ErrF])),
+            C ! {write, self(), <<2, " ", ErrBinF/binary>>},
+            C ! {exit, self(), 5},
+            exit(normal)
+    end,
     SC1.
 
 scp_read_file(Opts = #scp_opts{}, Path, Len, SC0 = #scp_state{state = S0, pid = C}) ->

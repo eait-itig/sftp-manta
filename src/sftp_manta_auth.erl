@@ -37,12 +37,17 @@
 -export([mahi_get_auth_user/2, mahi_get_auth_user/3]).
 -export([init/1, terminate/2, handle_call/3, handle_info/2]).
 
+-type peer() :: {inet:ip_address(), integer()}.
+-type time_ms() :: integer().
+
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+-spec is_auth_key(any(), string()) -> boolean().
 is_auth_key(PubKey, User) ->
     gen_server:call(?MODULE, {is_auth_key, PubKey, User}).
 
+-spec validate_pw(string() | binary(), string() | binary(), peer()) -> boolean() | disconnect.
 validate_pw(User, Pw, RemoteAddr) ->
     gen_server:call(?MODULE, {validate_pw, User, Pw, RemoteAddr}).
 
@@ -53,8 +58,32 @@ validate_pw(User, Pw, RemoteAddr) ->
     mahimon :: undefined | reference(),
     mode :: operator | mahi_plus_token,
     keys :: undefined | [term()],
-    keymtime :: undefined | calendar:datetime()
+    keymtime :: undefined | calendar:datetime(),
+    fails = #{} :: #{peer() => {Count :: integer(), LastFailure :: time_ms()}}
     }).
+
+gc_fails(S0 = #?MODULE{fails = F0}) ->
+    Now = erlang:system_time(millisecond),
+    F1 = maps:filter(fun (Ip, {Count, LastFail}) ->
+        (Now - LastFail) < 300000
+    end, F0),
+    S0#?MODULE{fails = F1}.
+
+incr_fails({Ip, _Port}, S0 = #?MODULE{fails = F0}) ->
+    {Count0, _T0} = maps:get(Ip, F0, {0, 0}),
+    F1 = F0#{Ip => {Count0 + 1, erlang:system_time(millisecond)}},
+    gc_fails(S0#?MODULE{fails = F1}).
+
+is_peer_banned({Ip, _Port}, S0 = #?MODULE{fails = F0}) ->
+    Now = erlang:system_time(millisecond),
+    case F0 of
+        #{Ip := {Count, LastFail}}
+                when (Count > 10) and ((Now - LastFail) < 60000) ->
+            F1 = F0#{Ip => {Count + 1, Now}},
+            {true, gc_fails(S0#?MODULE{fails = F1})};
+        _ ->
+            {false, gc_fails(S0)}
+    end.
 
 init([]) ->
     {ok, Mode} = application:get_env(sftp_manta, auth_mode),
@@ -243,45 +272,80 @@ handle_call({is_auth_key, PubKey, User}, _From, S0 = #?MODULE{mahi = MahiGun})
 handle_call({is_auth_key, _PubKey, _User}, _From, S0 = #?MODULE{}) ->
     {reply, false, S0};
 
-handle_call({validate_pw, User, Pw, _Ip}, _From,
-        S0 = #?MODULE{krb = Krb, mode = mahi_plus_token}) when is_pid(Krb) ->
-    PwBin = iolist_to_binary([Pw]),
-    MahiRes = case binary:split(iolist_to_binary([User]), [<<"@">>]) of
-        [SubuserName, AccountName] ->
-            mahi_get_auth_user(SubuserName, AccountName, S0#?MODULE.mahi);
-        [_Username] ->
-            mahi_get_auth_user(User, S0#?MODULE.mahi)
-    end,
-    case MahiRes of
-        {ok, _Account, #{<<"login">> := <<"anonymous">>}, _Roles} ->
-            lager:debug("accepted anonymous subuser ~p", [User]),
-            {reply, true, S0};
-        {ok, _Account, _Subuser, _Roles} ->
-            lager:debug("rejecting password auth for subuser ~p", [User]),
-            {reply, false, S0};
-        {ok, _Account, _Roles} ->
-            case krb_realm:authenticate(Krb, [User], PwBin) of
-                {ok, _Ticket} ->
-                    lager:debug("authed ~p with password", [User]),
-                    {reply, true, S0};
-                {error, Why} ->
-                    lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
-                    {reply, false, S0}
+handle_call({validate_pw, User, pubkey, Peer}, _From, S0 = #?MODULE{mode = M}) ->
+    case is_peer_banned(Peer, S0) of
+        {true, S1} ->
+            {reply, disconnect, S1};
+        {false, S1} when (M =:= mahi_plus_token) ->
+            MahiRes = case binary:split(iolist_to_binary([User]), [<<"@">>]) of
+                [SubuserName, AccountName] ->
+                    mahi_get_auth_user(SubuserName, AccountName, S0#?MODULE.mahi);
+                [_Username] ->
+                    mahi_get_auth_user(User, S0#?MODULE.mahi)
+            end,
+            case MahiRes of
+                {error, Err} ->
+                    lager:debug("mahi rejected user ~p: ~p", [User, Err]),
+                    {reply, false, incr_fails(Peer, S0)};
+                _ ->
+                    {reply, true, S0}
             end;
-        {error, Err} ->
-            lager:debug("mahi rejected user ~p: ~p", [User, Err]),
-            {reply, false, S0}
+        {false, S1} ->
+            {reply, true, S1}
     end;
 
-handle_call({validate_pw, User, Pw, _Ip}, _From,
+handle_call({validate_pw, User, Pw, Peer}, _From,
+        S0 = #?MODULE{krb = Krb, mode = mahi_plus_token}) when is_pid(Krb) ->
+    case is_peer_banned(Peer, S0) of
+        {true, S1} ->
+            {reply, disconnect, S1};
+        {false, S1} ->
+            #?MODULE{mahi = Mahi} = S1,
+            PwBin = iolist_to_binary([Pw]),
+            MahiRes = case binary:split(iolist_to_binary([User]), [<<"@">>]) of
+                [SubuserName, AccountName] ->
+                    mahi_get_auth_user(SubuserName, AccountName, Mahi);
+                [_Username] ->
+                    mahi_get_auth_user(User, Mahi)
+            end,
+            case MahiRes of
+                {ok, _Account, #{<<"login">> := <<"anonymous">>}, _Roles} ->
+                    lager:debug("accepted anonymous subuser ~p", [User]),
+                    {reply, true, S1};
+                {ok, _Account, _Subuser, _Roles} ->
+                    lager:debug("rejecting password auth for subuser ~p",
+                        [User]),
+                    {reply, false, S1};
+                {ok, _Account, _Roles} ->
+                    case krb_realm:authenticate(Krb, [User], PwBin) of
+                        {ok, _Ticket} ->
+                            lager:debug("authed ~p with password", [User]),
+                            {reply, true, S1};
+                        {error, Why} ->
+                            lager:debug("krb5 auth failed for ~p: ~p",
+                                [User, Why]),
+                            {reply, false, incr_fails(Peer, S1)}
+                    end;
+                {error, Err} ->
+                    lager:debug("mahi rejected user ~p: ~p", [User, Err]),
+                    {reply, false, incr_fails(Peer, S1)}
+            end
+    end;
+
+handle_call({validate_pw, User, Pw, Peer}, _From,
                 S0 = #?MODULE{krb = Krb, mode = operator}) when is_pid(Krb) ->
-    PwBin = iolist_to_binary([Pw]),
-    case krb_realm:authenticate(Krb, [User], PwBin) of
-        {ok, _Ticket} ->
-            {reply, true, S0};
-        {error, Why} ->
-            lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
-            {reply, false, S0}
+    case is_peer_banned(Peer, S0) of
+        {true, S1} ->
+            {reply, disconnect, S1};
+        {false, S1} ->
+            PwBin = iolist_to_binary([Pw]),
+            case krb_realm:authenticate(Krb, [User], PwBin) of
+                {ok, _Ticket} ->
+                    {reply, true, S1};
+                {error, Why} ->
+                    lager:debug("krb5 auth failed for ~p: ~p", [User, Why]),
+                    {reply, false, incr_fails(Peer, S1)}
+            end
     end;
 
 handle_call({validate_pw, _User, _Pw, _Ip}, _From, S0 = #?MODULE{}) ->

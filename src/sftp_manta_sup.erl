@@ -58,8 +58,18 @@ init([]) ->
         {subsystems, [SFTPSpec]},
         {ssh_cli, {sftp_manta_app, []}},
         {pwdfun, fun sftp_manta_app:validate_pw/4},
+        {pk_check_user, true},
         {key_cb, {sftp_manta_app, []}},
         {preferred_algorithms, [
+            {kex, ['ecdh-sha2-nistp384','ecdh-sha2-nistp521',
+                   'ecdh-sha2-nistp256','diffie-hellman-group-exchange-sha256',
+                   'diffie-hellman-group16-sha512',
+                   'diffie-hellman-group18-sha512',
+                   'diffie-hellman-group14-sha256',
+                   'diffie-hellman-group-exchange-sha1',
+                   'diffie-hellman-group14-sha1',
+                   'diffie-hellman-group1-sha1'
+                  ]},
             {public_key, ['ecdsa-sha2-nistp256', 'rsa-sha2-512', 'rsa-sha2-256', 'ssh-rsa']}
         ]},
         {recbuf, 128*1024},
