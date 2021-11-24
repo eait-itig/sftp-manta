@@ -166,15 +166,15 @@ handle_ssh_msg({ssh_cm, CM, {exec, ChanId, WantRep, Cmd}}, S = #scp_state{state 
     [{user, User}] = ssh_connection_handler:connection_info(CM, [user]),
     SS2 = login(User, SS1),
     SS3 = SS2#state{cwd = "/" ++ User ++ "/stor"},
-    S1 = S#scp_state{state = SS3},
+    S1 = S#scp_state{state = SS3, chan = ChanId, cm = CM},
     lager:debug("handling command ~p for ~p", [Cmd, User]),
     case list_to_binary(Cmd) of
         <<"scp ", Rem/binary>> ->
             case parse_scp_opts(#scp_opts{}, Rem) of
                 Opts = #scp_opts{bad = false} ->
-                    S2 = S1#scp_state{cmd = Cmd, chan = ChanId, cm = CM},
+                    S2 = S1#scp_state{cmd = Cmd},
                     ScpServPid = spawn_link(fun() ->
-                        scp_server_loop(Opts, S1)
+                        scp_server_loop(Opts, S2)
                     end),
                     ssh_connection:reply_request(CM, WantRep, success, ChanId),
                     S3 = S2#scp_state{srvpid = ScpServPid},
@@ -189,6 +189,20 @@ handle_ssh_msg({ssh_cm, CM, {exec, ChanId, WantRep, Cmd}}, S = #scp_state{state 
                     ssh_connection:send_eof(CM, ChanId),
                     {stop, ChanId, S1#scp_state{cm = CM, chan = ChanId}}
             end;
+        <<"get ", Path/binary>> ->
+            CmdPid = spawn_link(fun() ->
+                get_cmd_loop(Path, S1)
+            end),
+            ssh_connection:reply_request(CM, WantRep, success, ChanId),
+            S2 = S1#scp_state{srvpid = CmdPid},
+            {ok, S2};
+        <<"put ", Path/binary>> ->
+            CmdPid = spawn_link(fun() ->
+                put_cmd_loop(Path, S1)
+            end),
+            ssh_connection:reply_request(CM, WantRep, success, ChanId),
+            S2 = S1#scp_state{srvpid = CmdPid},
+            {ok, S2};
         _ ->
             ssh_connection:send(CM, ChanId, ?SSH_EXTENDED_DATA_DEFAULT,
                 io_lib:format("Unsupported command: ~99p\n", [Cmd])),
@@ -201,7 +215,7 @@ handle_ssh_msg({ssh_cm, CM, {exec, ChanId, WantRep, Cmd}}, S = #scp_state{state 
 handle_ssh_msg({ssh_cm, CM, {shell, ChanId, WantRep}}, S = #scp_state{}) ->
     ssh_connection:reply_request(CM, WantRep, success, ChanId),
     ssh_connection:send(CM, ChanId, ?SSH_EXTENDED_DATA_DEFAULT,
-        <<"Interactive shell not supported.\n">>),
+        <<"Interactive shell not supported.\r\n">>),
     ssh_connection:exit_status(CM, ChanId, -1),
     ssh_connection:send_eof(CM, ChanId),
     {stop, ChanId, S#scp_state{cm = CM, chan = ChanId}};
@@ -310,6 +324,117 @@ do_alt([Alt|Rest], File) ->
     match_part(Alt, File) orelse do_alt(Rest, File);
 do_alt([], _File) ->
     false.
+
+get_cmd_loop(Path, S0 = #scp_state{state = St0, pid = C}) ->
+    #state{host = Host, port = Port} = St0,
+    {ok, Fsm} = case St0 of
+        #state{amode = operator, signer = Signer} ->
+            file_read_fsm:start_link({Host, Port}, path_to_uri(Path), signature, Signer);
+        #state{amode = mahi_plus_token, token = Token} ->
+            file_read_fsm:start_link({Host, Port}, path_to_uri(Path), token, Token)
+    end,
+    case gen_statem:call(Fsm, connect) of
+        ok -> ok;
+        {error, {http, 404, #{<<"code">> := <<"ResourceNotFound">>}}} ->
+            ErrBin = iolist_to_binary(io_lib:format(
+                "Parent directory for ~s does not exist\n", [Path])),
+            C ! {write, self(), ErrBin},
+            C ! {exit, self(), 2},
+            exit(normal);
+        {error, {http, _, #{<<"code">> := Code, <<"message">> := Msg}}} ->
+            ErrBin = iolist_to_binary(io_lib:format("~p: ~s\n", [Code, Msg])),
+            C ! {write, self(), ErrBin},
+            C ! {exit, self(), 3},
+            exit(normal);
+        {error, {http, Code}} ->
+            ErrBin = iolist_to_binary(io_lib:format(
+                "manta returned HTTP ~p\n", [Code])),
+            C ! {write, self(), ErrBin},
+            C ! {exit, self(), 4},
+            exit(normal);
+        {error, Err} ->
+            ErrBin = iolist_to_binary(io_lib:format("~999p\n", [Err])),
+            C ! {write, self(), ErrBin},
+            C ! {exit, self(), 5},
+            exit(normal)
+    end,
+    PathParts = binary:split(Path, [<<"/">>], [global]),
+    Fname = lists:last(PathParts),
+    S1 = get_cmd_next_chunk(Fsm, S0),
+    ok = gen_statem:call(Fsm, close),
+    C ! {exit, self(), 0},
+    exit(normal).
+
+get_cmd_next_chunk(Fsm, S0 = #scp_state{pid = C}) ->
+    ToRead = 131072,
+    case gen_statem:call(Fsm, {read, ToRead}) of
+        eof ->
+            S0;
+        {ok, Data} ->
+            C ! {write, self(), Data},
+            erlang:garbage_collect(),
+            get_cmd_next_chunk(Fsm, S0)
+    end.
+
+put_cmd_loop(Path, S0 = #scp_state{state = St0, pid = C}) ->
+    #state{host = Host, port = Port} = St0,
+    {ok, Fsm} = case St0 of
+        #state{amode = operator, signer = Signer} ->
+            file_write_fsm:start_link({Host, Port}, path_to_uri(Path), signature, Signer);
+        #state{amode = mahi_plus_token, token = Token} ->
+            file_write_fsm:start_link({Host, Port}, path_to_uri(Path), token, Token)
+    end,
+    case gen_statem:call(Fsm, connect) of
+        ok -> ok;
+        {error, {http, 404, #{<<"code">> := <<"ResourceNotFound">>}}} ->
+            ErrBin = iolist_to_binary(io_lib:format(
+                "Parent directory for ~s does not exist\n", [Path])),
+            C ! {write, self(), ErrBin},
+            C ! {exit, self(), 2},
+            exit(normal);
+        {error, {http, _, #{<<"code">> := Code, <<"message">> := Msg}}} ->
+            ErrBin = iolist_to_binary(io_lib:format("~p: ~s\n", [Code, Msg])),
+            C ! {write, self(), ErrBin},
+            C ! {exit, self(), 3},
+            exit(normal);
+        {error, {http, Code}} ->
+            ErrBin = iolist_to_binary(io_lib:format(
+                "manta returned HTTP ~p\n", [Code])),
+            C ! {write, self(), ErrBin},
+            C ! {exit, self(), 4},
+            exit(normal);
+        {error, Err} ->
+            ErrBin = iolist_to_binary(io_lib:format("~999p\n", [Err])),
+            C ! {write, self(), ErrBin},
+            C ! {exit, self(), 5},
+            exit(normal)
+    end,
+    S1 = put_cmd_next_chunk(Fsm, S0),
+    case gen_statem:call(Fsm, close) of
+        ok -> ok;
+        {error, {http, _, #{<<"code">> := CodeF, <<"message">> := MsgF}}} ->
+            ErrBinF = iolist_to_binary(io_lib:format("~p: ~s\n", [CodeF, MsgF])),
+            C ! {write, self(), ErrBinF},
+            C ! {exit, self(), 3},
+            exit(normal);
+        {error, ErrF} ->
+            ErrBinF = iolist_to_binary(io_lib:format("~999p\n", [ErrF])),
+            C ! {write, self(), ErrBinF},
+            C ! {exit, self(), 5},
+            exit(normal)
+    end,
+    C ! {exit, self(), 0},
+    exit(normal).
+
+put_cmd_next_chunk(Fsm, S0 = #scp_state{pid = C}) ->
+    receive
+        {data, C, Data} ->
+            ok = gen_statem:call(Fsm, {write, Data}),
+            erlang:garbage_collect(),
+            put_cmd_next_chunk(Fsm, S0);
+        {eof, C} ->
+            S0
+    end.
 
 scp_server_loop(Opts, {stop, #scp_state{pid = C}}) ->
     C ! {exit, self(), 0};
