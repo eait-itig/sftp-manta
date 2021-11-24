@@ -411,7 +411,9 @@ put_cmd_loop(Path, S0 = #scp_state{state = St0, pid = C}) ->
     end,
     S1 = put_cmd_next_chunk(Fsm, S0),
     case gen_statem:call(Fsm, close) of
-        ok -> ok;
+        ok ->
+            C ! {exit, self(), 0},
+            exit(normal);
         {error, {http, _, #{<<"code">> := CodeF, <<"message">> := MsgF}}} ->
             ErrBinF = iolist_to_binary(io_lib:format("~p: ~s\n", [CodeF, MsgF])),
             C ! {write, self(), ErrBinF},
@@ -422,9 +424,7 @@ put_cmd_loop(Path, S0 = #scp_state{state = St0, pid = C}) ->
             C ! {write, self(), ErrBinF},
             C ! {exit, self(), 5},
             exit(normal)
-    end,
-    C ! {exit, self(), 0},
-    exit(normal).
+    end.
 
 put_cmd_next_chunk(Fsm, S0 = #scp_state{pid = C}) ->
     receive
