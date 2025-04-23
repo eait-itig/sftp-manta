@@ -36,6 +36,7 @@
 -export([start_link/0, is_auth_key/2, validate_pw/3]).
 -export([mahi_get_auth_user/2, mahi_get_auth_user/3]).
 -export([init/1, terminate/2, handle_call/3, handle_info/2]).
+-export([handle_cast/2]).
 
 -type peer() :: {inet:ip_address(), integer()}.
 -type time_ms() :: integer().
@@ -64,7 +65,7 @@ validate_pw(User, Pw, RemoteAddr) ->
 
 gc_fails(S0 = #?MODULE{fails = F0}) ->
     Now = erlang:system_time(millisecond),
-    F1 = maps:filter(fun (Ip, {Count, LastFail}) ->
+    F1 = maps:filter(fun (_Ip, {_Count, LastFail}) ->
         (Now - LastFail) < 300000
     end, F0),
     S0#?MODULE{fails = F1}.
@@ -128,7 +129,7 @@ check_update_keys(S0 = #?MODULE{keymtime = OldMTime}) ->
 
                 {ok, #file_info{type = regular, mtime = NewMTime}} ->
                     {ok, Data} = file:read_file(Filename),
-                    Keys = public_key:ssh_decode(Data, auth_keys),
+                    Keys = ssh_file:decode(Data, auth_keys),
                     S0#?MODULE{keys = Keys, keymtime = NewMTime};
 
                 {ok, #file_info{type = Other}} ->
@@ -286,9 +287,9 @@ handle_call({validate_pw, User, pubkey, Peer}, _From, S0 = #?MODULE{mode = M}) -
             case MahiRes of
                 {error, Err} ->
                     lager:debug("mahi rejected user ~p: ~p", [User, Err]),
-                    {reply, false, incr_fails(Peer, S0)};
+                    {reply, false, incr_fails(Peer, S1)};
                 _ ->
-                    {reply, true, S0}
+                    {reply, true, S1}
             end;
         {false, S1} ->
             {reply, true, S1}
@@ -376,4 +377,7 @@ handle_info({gun_down, Pid, _Proto, _Reason, _}, S0 = #?MODULE{mahi = Pid}) ->
 handle_info({gun_up, Pid, _Proto}, S0 = #?MODULE{mahi = Pid}) ->
     {noreply, S0};
 handle_info({gun_error, Pid, _Reason}, S0 = #?MODULE{mahi = Pid}) ->
+    {noreply, S0}.
+
+handle_cast(_, S0 = #?MODULE{}) ->
     {noreply, S0}.

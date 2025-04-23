@@ -39,7 +39,7 @@ handle(IsFin, Data, State=#state{reply_to=ReplyTo, stream_ref=StreamRef}) ->
         {'DOWN', MRef, process, _, _Reason} -> ok
     end,
     demonitor(MRef),
-    {done, State}.
+    {done, 1, State}.
 
 await_body(ServerPid, StreamRef) ->
     MRef = monitor(process, ServerPid),

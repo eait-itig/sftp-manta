@@ -115,7 +115,7 @@ request(Verb, Url, Hdrs0, #state{gun = Gun, signer = Signer, amode = signature})
         delete -> "DELETE"
     end,
     Hdrs2 = maps:to_list(Hdrs1),
-    gun:request(Gun, Method, Url, Hdrs2);
+    gun:headers(Gun, Method, Url, Hdrs2);
 request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = token}) ->
     Authz = iolist_to_binary([<<"Token ">>, Token]),
     Hdrs1 = Hdrs0#{<<"authorization">> => Authz},
@@ -127,7 +127,7 @@ request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = token}) ->
         delete -> "DELETE"
     end,
     Hdrs2 = maps:to_list(Hdrs1),
-    gun:request(Gun, Method, Url, Hdrs2).
+    gun:headers(Gun, Method, Url, Hdrs2).
 
 fn_ext_to_mime(Fname) when is_list(Fname) ->
     fn_ext_to_mime(unicode:characters_to_binary(Fname, utf8));
@@ -183,7 +183,7 @@ disconnected(enter, _, _S) ->
     keep_state_and_data;
 disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path = Path}) ->
     {ok, Gun} = gun:open(Host, Port, #{
-        transport_opts => [
+        tcp_opts => [
             {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
             {keepalive, true}
         ],
@@ -204,11 +204,11 @@ disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path =
         {gun_inform, Gun, Stream, 100, _} ->
             gen_statem:reply(From, ok),
             {next_state, flowing, S1#state{stream = Stream}};
-        {gun_inform, Gun, Stream, Status, Headers} ->
+        {gun_inform, Gun, Stream, Status, _Headers} ->
             gen_statem:reply(From, {error, {http, Status}}),
             gun:close(Gun),
             {stop, normal};
-        {gun_response, Gun, Stream, fin, Status, Headers} ->
+        {gun_response, Gun, Stream, fin, Status, _Headers} ->
             gen_statem:reply(From, {error, {http, Status}}),
             gun:close(Gun),
             {stop, normal};
@@ -319,7 +319,7 @@ flowing({call, From}, close, #state{gun = Gun, stream = Stream}) ->
             {stop, normal}
     end.
 
-read_loop(WriteFSM, ReadFSM, 0) ->
+read_loop(_WriteFSM, _ReadFSM, 0) ->
     ok;
 read_loop(WriteFSM, ReadFSM, N) ->
     ToRead = if (N > 131072) -> 131072; true -> N end,

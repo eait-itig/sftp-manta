@@ -224,7 +224,7 @@ handle_ssh_msg({ssh_cm, CM, {data, _ChanId, _Type, Data}}, S = #scp_state{cm = C
     Pid ! {data, Me, Data},
     {ok, S};
 
-handle_ssh_msg({ssh_cm, CM, {eof, ChanId}}, S = #scp_state{cm = CM, pid = Me, srvpid = Pid}) ->
+handle_ssh_msg({ssh_cm, CM, {eof, _ChanId}}, S = #scp_state{cm = CM, pid = Me, srvpid = Pid}) ->
     Pid ! {eof, Me},
     {ok, S};
 
@@ -248,7 +248,7 @@ parse_scp_opts(O, <<"-f ", Target/binary>>) ->
     O#scp_opts{mode = sender, target = Target};
 parse_scp_opts(O, <<"-t ", Target/binary>>) ->
     O#scp_opts{mode = receiver, target = Target};
-parse_scp_opts(O, <<"-", Opt:1/binary, Rem/binary>>) ->
+parse_scp_opts(O, <<"-", Opt:1/binary, _Rem/binary>>) ->
     O#scp_opts{bad = Opt}.
 
 await_line(S = #scp_state{buf = [], hadeof = true}) ->
@@ -268,7 +268,7 @@ await_line(S = #scp_state{pid = C, buf = B0}) ->
             end
     end.
 
-await_bytes(N, S = #scp_state{buf = [], hadeof = true}) ->
+await_bytes(_N, S = #scp_state{buf = [], hadeof = true}) ->
     {eof, S};
 await_bytes(N, S = #scp_state{buf = [Chunk0 | B1]}) ->
     if
@@ -358,9 +358,7 @@ get_cmd_loop(Path, S0 = #scp_state{state = St0, pid = C}) ->
             C ! {exit, self(), 5},
             exit(normal)
     end,
-    PathParts = binary:split(Path, [<<"/">>], [global]),
-    Fname = lists:last(PathParts),
-    S1 = get_cmd_next_chunk(Fsm, S0),
+    _S1 = get_cmd_next_chunk(Fsm, S0),
     ok = gen_statem:call(Fsm, close),
     C ! {exit, self(), 0},
     exit(normal).
@@ -409,7 +407,7 @@ put_cmd_loop(Path, S0 = #scp_state{state = St0, pid = C}) ->
             C ! {exit, self(), 5},
             exit(normal)
     end,
-    S1 = put_cmd_next_chunk(Fsm, S0),
+    _S1 = put_cmd_next_chunk(Fsm, S0),
     case gen_statem:call(Fsm, close) of
         ok ->
             C ! {exit, self(), 0},
@@ -436,18 +434,17 @@ put_cmd_next_chunk(Fsm, S0 = #scp_state{pid = C}) ->
             S0
     end.
 
-scp_server_loop(Opts, {stop, #scp_state{pid = C}}) ->
+scp_server_loop(_Opts, {stop, #scp_state{pid = C}}) ->
     C ! {exit, self(), 0};
-scp_server_loop(Opts, {error, Msg, #scp_state{pid = C}}) ->
+scp_server_loop(_Opts, {error, Msg, #scp_state{pid = C}}) ->
     C ! {write, self(), <<2, Msg/binary, "\n">>},
     C ! {exit, self(), 1};
 scp_server_loop(Opts = #scp_opts{mode = sender, target = T, recursive = false},
-        S0 = #scp_state{state = St0, pid = C, buf = B}) ->
+        S0 = #scp_state{state = St0, pid = C}) ->
     TStr = unicode:characters_to_list(T, utf8),
     {compiled_wildcard, Patt} = filelib:compile_wildcard(TStr),
-    {Files, S1} = case Patt of
+    {Files, _S1} = case Patt of
         {{exists, [$/ | Path]}, 0} ->
-            #state{user = U} = St0,
             N = iolist_to_binary([$/, Path]),
             case get_stat(N, St0) of
                 {ok, #file_info{size = Sz}, St1} ->
@@ -492,7 +489,7 @@ scp_server_loop(Opts = #scp_opts{mode = sender, target = T, recursive = false},
             C ! {write, self(), <<2, "no objects found\n">>},
             C ! {exit, self(), 1};
         _ ->
-            Snext = lists:foldl(fun ({Path, Sz}, SS0) ->
+            _Snext = lists:foldl(fun ({Path, Sz}, SS0) ->
                 SS1 = scp_read_file(Opts, Path, Sz, SS0),
                 C ! {write, self(), <<0>>},
                 {<<0>>, SS2} = await_bytes(1, SS1),
@@ -500,8 +497,7 @@ scp_server_loop(Opts = #scp_opts{mode = sender, target = T, recursive = false},
             end, S0, Files),
             C ! {exit, self(), 0}
     end;
-scp_server_loop(Opts = #scp_opts{mode = sender, target = T},
-        S0 = #scp_state{pid = C, buf = B}) ->
+scp_server_loop(#scp_opts{mode = sender}, #scp_state{pid = C}) ->
     lager:debug("TODO: implement sender mode"),
     C ! {write, self(), <<2, "scp source mode not implemented\n">>},
     C ! {exit, self(), 1};
@@ -510,12 +506,11 @@ scp_server_loop(Opts = #scp_opts{mode = receiver, target = <<".">>,
     C ! {write, self(), <<0>>},
     {L, S1} = await_line(S0),
     SS = S1#scp_state.state,
-    lager:debug("read line ~p", [L]),
     Snext = case L of
         <<"C", _/binary>> ->
             [<<"C", ModeBin:4/binary>>, Rest0] = binary:split(L, [<<" ">>]),
             [LenBin, PathBin] = binary:split(Rest0, [<<" ">>]),
-            Mode = binary_to_integer(ModeBin, 8),
+            _Mode = binary_to_integer(ModeBin, 8),
             Len = binary_to_integer(LenBin),
             C ! {write, self(), <<0>>},
             {Path, S2} = case get_stat(SS#state.cwd, SS) of
@@ -537,8 +532,8 @@ scp_server_loop(Opts = #scp_opts{mode = receiver, target = <<".">>,
             {<<0>>, S4} = await_bytes(1, S3),
             S4;
         <<"D", _/binary>> when Opts#scp_opts.recursive ->
-            [<<"D", ModeBin:4/binary>>, Rest0] = binary:split(L, [<<" ">>]),
-            [LenBin, PathBin] = binary:split(Rest0, [<<" ">>]),
+            [<<"D", _ModeBin:4/binary>>, Rest0] = binary:split(L, [<<" ">>]),
+            [_LenBin, PathBin] = binary:split(Rest0, [<<" ">>]),
             NewCwd = SS#state.cwd ++ "/" ++
                 unicode:characters_to_list(PathBin, utf8),
             Stack = [SS#state.cwd | S1#scp_state.cwdstack],
@@ -660,7 +655,7 @@ scp_read_file(Opts = #scp_opts{}, Path, Len, SC0 = #scp_state{state = S0, pid = 
     ok = gen_statem:call(Fsm, close),
     SC1.
 
-scp_read_next_chunk(Opts, Fsm, 0, S0) -> S0;
+scp_read_next_chunk(_Opts, _Fsm, 0, S0) -> S0;
 scp_read_next_chunk(Opts, Fsm, RemLen, S0 = #scp_state{pid = C}) ->
     ToRead = if (RemLen > 131072) -> 131072; true -> RemLen end,
     {ok, Data} = gen_statem:call(Fsm, {read, ToRead}),
@@ -669,7 +664,7 @@ scp_read_next_chunk(Opts, Fsm, RemLen, S0 = #scp_state{pid = C}) ->
     erlang:garbage_collect(),
     scp_read_next_chunk(Opts, Fsm, RemLen2, S0).
 
-scp_write_next_chunk(Opts, Fsm, 0, S0) -> S0;
+scp_write_next_chunk(_Opts, _Fsm, 0, S0) -> S0;
 scp_write_next_chunk(Opts, Fsm, RemLen, S0 = #scp_state{}) ->
     ToRead = if (RemLen > 131072) -> 131072; true -> RemLen end,
     {Data, S1} = await_bytes(ToRead, S0),
@@ -696,7 +691,7 @@ request(Verb, Url, Hdrs0, #state{gun = Gun, signer = Signer, amode = operator}) 
         delete -> "DELETE"
     end,
     Hdrs2 = maps:to_list(Hdrs1),
-    gun:request(Gun, Method, Url, Hdrs2);
+    gun:request(Gun, Method, Url, Hdrs2, <<>>);
 request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = mahi_plus_token}) ->
     Authz = iolist_to_binary([<<"Token ">>, Token]),
     Hdrs1 = Hdrs0#{<<"authorization">> => Authz},
@@ -708,7 +703,7 @@ request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = mahi_plus_tok
         delete -> "DELETE"
     end,
     Hdrs2 = maps:to_list(Hdrs1),
-    gun:request(Gun, Method, Url, Hdrs2).
+    gun:request(Gun, Method, Url, Hdrs2, <<>>).
 
 %
 % General SSH server callbacks (login etc)
@@ -724,12 +719,18 @@ login(User, S = #state{amode = operator}) ->
     Fp = http_signature_key:fingerprint(SigKey0),
     UserBin = unicode:characters_to_binary(User, utf8),
     SigKey1 = SigKey0#{
-        id := <<"/", UserBin/binary, "/keys/", Fp/binary>>,
-        module := http_signature_ecdsa_joyent
+        id => <<"/", UserBin/binary, "/keys/", Fp/binary>>,
+        module => http_signature_ecdsa
     },
     Signer = http_signature_signer:new(SigKey1, <<"ecdsa-sha256">>,
         [<<"date">>]),
-    {ok, Conn} = gun:open(S#state.host, S#state.port),
+    {ok, Conn} = gun:open(S#state.host, S#state.port, #{
+        tcp_opts => [
+            {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
+            {keepalive, true}
+        ],
+        retry => 0
+    }),
     {ok, _} = gun:await_up(Conn, 30000),
     S#state{user = User, signer = Signer, gun = Conn};
 
@@ -755,7 +756,6 @@ login(User, S = #state{amode = mahi_plus_token}) ->
                 #{<<"defaultRoles">> := D} -> D;
                 _ -> []
             end,
-            SubuserJson = null,
             jsx:encode(#{
                 <<"v">> => 2,
                 <<"p">> => #{
@@ -793,7 +793,7 @@ login(User, S = #state{amode = mahi_plus_token}) ->
                 },
                 <<"t">> => erlang:system_time(millisecond)
             });
-        Err = {error, Why} ->
+        {error, Why} ->
             lager:error("login failed for ~s: ~p", [User, Why]),
             error(Why)
     end,
@@ -811,7 +811,7 @@ login(User, S = #state{amode = mahi_plus_token}) ->
     Token = base64:encode(TokenEnc),
 
     {ok, Gun} = gun:open(S#state.host, S#state.port, #{
-        transport_opts => [
+        tcp_opts => [
             {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
             {keepalive, true}
         ],

@@ -145,7 +145,7 @@ request(Verb, Url, Hdrs0, #state{gun = Gun, signer = Signer, amode = signature})
         delete -> "DELETE"
     end,
     Hdrs2 = maps:to_list(Hdrs1),
-    gun:request(Gun, Method, Url, Hdrs2);
+    gun:request(Gun, Method, Url, Hdrs2, <<>>);
 request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = token}) ->
     Authz = iolist_to_binary([<<"Token ">>, Token]),
     Hdrs1 = Hdrs0#{<<"authorization">> => Authz},
@@ -157,7 +157,7 @@ request(Verb, Url, Hdrs0, #state{gun = Gun, token = Token, amode = token}) ->
         delete -> "DELETE"
     end,
     Hdrs2 = maps:to_list(Hdrs1),
-    gun:request(Gun, Method, Url, Hdrs2).
+    gun:request(Gun, Method, Url, Hdrs2, <<>>).
 
 init([{Host, Port}, Path, signature, Signer]) ->
     S0 = #state{host = Host, port = Port, path = Path,
@@ -172,7 +172,7 @@ disconnected(enter, _, _S) ->
     keep_state_and_data;
 disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path = Path}) ->
     {ok, Gun} = gun:open(Host, Port, #{
-        transport_opts => [
+        tcp_opts => [
             {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
             {keepalive, true}
         ],
