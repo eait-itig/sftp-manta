@@ -90,7 +90,7 @@ start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
     host,
     port,
     path,
-    gun,
+    gun :: pid(),
     amode,
     signer,
     token,
@@ -102,7 +102,7 @@ start_link({Host, Port}, Path, AuthMode, SignerOrToken) ->
     waiter = none,
     reader = none,
     mref,
-    ackref = none,
+    ackref = none :: none | ack,
     rpos = 0,
     spos = 0,
     buf = [],
@@ -176,7 +176,8 @@ disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path =
             {recbuf, 128*1024}, {sndbuf, 128*1024}, {buffer, 256*1024},
             {keepalive, true}
         ],
-        retry => 0
+        retry => 0,
+        http_opts => #{flow => 1}
     }),
     {ok, _} = gun:await_up(Gun),
     MRef = monitor(process, Gun),
@@ -228,7 +229,7 @@ ready({call, From}, {position, Offset}, S = #state{rng = true, gun = Gun}) ->
         {response, nofin, Status, Headers} ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
             ErrInfo = case ContentType of
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}
@@ -270,7 +271,7 @@ ready({call, From}, {position, Offset}, S = #state{rng = false, gun = Gun}) ->
         {response, nofin, Status, Headers} ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
             ErrInfo = case ContentType of
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}
@@ -297,7 +298,7 @@ ready({call, From}, {read, Len}, S = #state{gun = Gun}) ->
         {response, nofin, Status, Headers} ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
             ErrInfo = case ContentType of
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}
@@ -329,8 +330,8 @@ ended(enter, _, S = #state{reader = {From, Len}, blen = BL, ackref = none}) ->
     {keep_state, S2};
 ended(enter, _, #state{ackref = none}) ->
     keep_state_and_data;
-ended(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
-    Gun ! {gun_data_ack, self(), Stream, AckRef},
+ended(enter, _, S = #state{gun = Gun, stream = Stream, ackref = ack}) ->
+    ok = gun:update_flow(Gun, Stream, 1),
     {repeat_state, S#state{ackref = none}};
 ended({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) ->
     RPos2 = case Offset of
@@ -408,15 +409,15 @@ maybe_reply_reader(S = #state{}) -> S.
 
 skipping(enter, _, #state{ackref = none}) ->
     keep_state_and_data;
-skipping(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
-    Gun ! {gun_data_ack, self(), Stream, AckRef},
+skipping(enter, _, S = #state{gun = Gun, stream = Stream, ackref = _AckRef}) ->
+    ok = gun:update_flow(Gun, Stream, 1),
     {keep_state, S#state{ackref = none}};
 skipping({call, From}, {read, Len}, S = #state{}) ->
     {next_state, skipping, S#state{reader = {From, Len}}};
 skipping({call, From}, {write, _Data}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
-skipping(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
+skipping(info, {gun_data, Gun, Stream, nofin, Data}, S = #state{gun = Gun, stream = Stream}) ->
     #state{spos = SPos, rpos = RPos} = S,
     SPos2 = SPos + size(Data),
     if
@@ -430,14 +431,14 @@ skipping(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gu
             ToKeep = SPos2 - RPos,
             ToDiscard = size(Data) - ToKeep,
             <<_Dropped:ToDiscard/binary, Rem/binary>> = Data,
-            S2 = S1#state{buf = [Rem], blen = size(Rem), spos = SPos2, ackref = AckRef},
+            S2 = S1#state{buf = [Rem], blen = size(Rem), spos = SPos2, ackref = ack},
             lager:debug("skip ended, bufsz = ~p, spos = ~p", [size(Rem), SPos2]),
             S3 = maybe_reply_reader(S2),
             {next_state, flowing, S3};
         true ->
-            {repeat_state, S#state{spos = SPos2, ackref = AckRef}}
+            {repeat_state, S#state{spos = SPos2, ackref = ack}}
     end;
-skipping(info, {gun_data, Gun, Stream, fin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
+skipping(info, {gun_data, Gun, Stream, fin, Data}, S = #state{gun = Gun, stream = Stream}) ->
     #state{spos = SPos, rpos = RPos} = S,
     SPos2 = SPos + size(Data),
     S1 = case S of
@@ -450,7 +451,7 @@ skipping(info, {gun_data, Gun, Stream, fin, Data, AckRef}, S = #state{gun = Gun,
         (SPos2 > RPos) ->
             ToDiscard = size(Data) - (SPos2 - RPos),
             <<_Dropped:ToDiscard/binary, Rem/binary>> = Data,
-            S2 = S1#state{buf = [Rem], blen = size(Rem), spos = SPos2, ackref = AckRef},
+            S2 = S1#state{buf = [Rem], blen = size(Rem), spos = SPos2, ackref = ack},
             lager:debug("skip ended at eof, bufsz = ~p, spos = ~p", [size(Rem), SPos2]),
             S3 = maybe_reply_reader(S2),
             {next_state, ended, S3};
@@ -468,7 +469,7 @@ skipping({call, From}, close, S = #state{gun = Gun, stream = Stream}) ->
     gun:cancel(Gun, Stream),
     case S#state.ackref of
         none -> ok;
-        AckRef -> Gun ! {gun_data_ack, self(), Stream, AckRef}
+        ack -> ok = gun:update_flow(Gun, Stream, 1)
     end,
     gun:flush(Gun),
     gun:close(Gun),
@@ -477,8 +478,8 @@ skipping({call, From}, close, S = #state{gun = Gun, stream = Stream}) ->
 
 flowing(enter, _, #state{ackref = none}) ->
     keep_state_and_data;
-flowing(enter, _, S = #state{gun = Gun, stream = Stream, ackref = AckRef}) ->
-    Gun ! {gun_data_ack, self(), Stream, AckRef},
+flowing(enter, _, S = #state{gun = Gun, stream = Stream, ackref = ack}) ->
+    ok = gun:update_flow(Gun, Stream, 1),
     {keep_state, S#state{ackref = none}};
 
 flowing({call, From}, {read, Len}, S = #state{blen = BL}) when (BL >= Len) ->
@@ -524,20 +525,20 @@ flowing({call, From}, {position, Offset}, S = #state{rpos = RPos, spos = SPos}) 
             {next_state, ready, S, postpone}
     end;
 
-flowing(info, {gun_data, Gun, Stream, fin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
+flowing(info, {gun_data, Gun, Stream, fin, Data}, S = #state{gun = Gun, stream = Stream}) ->
     #state{spos = SPos} = S,
     S1 = append_buf(Data, S),
     SPos2 = SPos + size(Data),
     S2 = S1#state{spos = SPos2},
     S3 = maybe_reply_reader(S2),
-    S4 = S3#state{ackref = AckRef},
+    S4 = S3#state{ackref = ack},
     {next_state, ended, S4};
-flowing(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
+flowing(info, {gun_data, Gun, Stream, nofin, Data}, S = #state{gun = Gun, stream = Stream}) ->
     #state{spos = SPos} = S,
     SPos2 = SPos + size(Data),
     S1 = append_buf(Data, S#state{spos = SPos2}),
     S2 = maybe_reply_reader(S1),
-    S3 = S2#state{ackref = AckRef},
+    S3 = S2#state{ackref = ack},
     if
         (S3#state.blen > ?BUF_MAX) -> {next_state, corked, S3};
         true -> {repeat_state, S3}
@@ -554,7 +555,7 @@ flowing({call, From}, close, S = #state{gun = Gun, stream = Stream}) ->
     gun:cancel(Gun, Stream),
     case S#state.ackref of
         none -> ok;
-        AckRef -> Gun ! {gun_data_ack, self(), Stream, AckRef}
+        ack -> ok = gun:update_flow(Gun, Stream, 1)
     end,
     gun:flush(Gun),
     gun:close(Gun),
@@ -582,12 +583,12 @@ corked({call, From}, {write, _Data}, #state{}) ->
     gen_statem:reply(From, {error, ebadf}),
     keep_state_and_data;
 
-corked(info, {gun_data, Gun, Stream, nofin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
+corked(info, {gun_data, Gun, Stream, nofin, Data}, S = #state{gun = Gun, stream = Stream}) ->
     S1 = append_buf(Data, S),
-    {keep_state, S1#state{ackref = AckRef}};
-corked(info, {gun_data, Gun, Stream, fin, Data, AckRef}, S = #state{gun = Gun, stream = Stream}) ->
+    {keep_state, S1#state{ackref = ack}};
+corked(info, {gun_data, Gun, Stream, fin, Data}, S = #state{gun = Gun, stream = Stream}) ->
     S1 = append_buf(Data, S),
-    {next_state, ended, S1#state{ackref = AckRef}};
+    {next_state, ended, S1#state{ackref = ack}};
 
 corked(info, {gun_error, Gun, Stream, Reason}, S = #state{gun = Gun, stream = Stream}) ->
     {next_state, errored, S#state{error = {gun_strm_error, Reason}}};
@@ -600,7 +601,7 @@ corked({call, From}, close, S = #state{gun = Gun, stream = Stream}) ->
     gun:cancel(Gun, Stream),
     case S#state.ackref of
         none -> ok;
-        AckRef -> Gun ! {gun_data_ack, self(), Stream, AckRef}
+        ack -> ok = gun:update_flow(Gun, Stream, 1)
     end,
     gun:flush(Gun),
     gun:close(Gun),

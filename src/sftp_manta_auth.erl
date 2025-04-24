@@ -154,14 +154,14 @@ mahi_get_auth_user(User, Account, MahiGun) ->
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := <<"application/json">>} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
+            {ok, Body} = sftp_manta_gun:await_body(MahiGun, Stream, 10000),
             #{<<"account">> := AccountObj, <<"user">> := UserObj,
                 <<"roles">> := Roles} = jsx:decode(Body, [return_maps]),
             {ok, AccountObj, UserObj, Roles};
         {response, nofin, Status, Headers} ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(MahiGun, Stream, 30000),
             ErrInfo = case ContentType of
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}
@@ -180,14 +180,14 @@ mahi_get_auth_user(User, MahiGun) ->
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := <<"application/json">>} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 10000),
+            {ok, Body} = sftp_manta_gun:await_body(MahiGun, Stream, 10000),
             #{<<"account">> := Account, <<"roles">> := Roles} =
                 jsx:decode(Body, [return_maps]),
             {ok, Account, Roles};
         {response, nofin, Status, Headers} ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(MahiGun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(MahiGun, Stream, 30000),
             ErrInfo = case ContentType of
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}

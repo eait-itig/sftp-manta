@@ -976,6 +976,7 @@ get_stat(Path, S = #state{statcache = Cache, gun = Gun}) ->
                     Cache2 = Cache#{Path => #{ts => Now, stat => Stat}},
                     {ok, Stat, S#state{statcache = Cache2}};
                 {response, fin, 404, _} ->
+                    lager:debug("stat on ~p returned 404", [Path]),
                     Cache2 = Cache#{Path => #{ts => Now, error => enoent}},
                     {error, enoent, S#state{statcache = Cache2}};
                 {response, fin, 403, _} ->
@@ -1011,12 +1012,17 @@ fetch_dir_lim(Gun, BaseUri, Marker, S) ->
     Uri = iolist_to_binary([BaseUri, "?", uri_string:compose_query(Qs)]),
     Stream = request(get, Uri, InHdrs, S),
     case gun:await(Gun, Stream, 30000) of
+        {response, fin, Status, Headers} when (Status < 300) ->
+            Hdrs = maps:from_list(Headers),
+            #{<<"content-type">> := ContentType} = Hdrs,
+            <<"application/x-json-stream; type=directory">> = ContentType,
+            {ok, []};
         {response, nofin, Status, Headers} when (Status < 300) ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
             <<"application/x-json-stream; type=directory">> = ContentType,
 
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
             Lines = binary:split(Body, [<<"\n">>], [global, trim]),
             Objs = [jsx:decode(Line, [return_maps]) || Line <- Lines],
             case Objs of
@@ -1041,7 +1047,7 @@ fetch_dir_lim(Gun, BaseUri, Marker, S) ->
             Hdrs = maps:from_list(Headers),
             ErrInfo = case Hdrs of
                 #{<<"content-type">> := ContentType} ->
-                    {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+                    {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
                     case ContentType of
                         <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                         _ -> {http, Status, Body}
@@ -1051,7 +1057,8 @@ fetch_dir_lim(Gun, BaseUri, Marker, S) ->
             end,
             lager:debug("list_dir returned ~p", [ErrInfo]),
             {error, ErrInfo};
-        {response, _Mode, _Status, _Headers} ->
+        {response, _Mode, Status, _Headers} ->
+            lager:debug("list_dir got http ~p", [Status]),
             gun:cancel(Gun, Stream),
             gun:flush(Stream),
             {error, enotdir}
@@ -1105,7 +1112,7 @@ delete(Path, S = #state{gun = Gun}) ->
         {response, nofin, Status, Headers} when (Status > 300) ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
             ErrInfo = case ContentType of
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}
@@ -1146,11 +1153,12 @@ make_dir(Path, S = #state{gun = Gun}) ->
                     S3 = S2#state{statcache = Cache2},
                     {ok, S3};
                 {response, fin, Status, _Headers} ->
+                    lager:debug("mkdir returned http ~p", [Status]),
                     {{error, {http, Status}}, S};
                 {response, nofin, Status, Headers} when (Status > 300) ->
                     Hdrs = maps:from_list(Headers),
                     #{<<"content-type">> := ContentType} = Hdrs,
-                    {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+                    {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
                     ErrInfo = case ContentType of
                         <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                         _ -> {http, Status, Body}
@@ -1285,7 +1293,7 @@ rename(Path, Path2, S = #state{gun = Gun}) ->
         {response, nofin, Status, Headers} when (Status > 300) ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
             ErrInfo = case ContentType of
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}

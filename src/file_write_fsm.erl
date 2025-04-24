@@ -215,7 +215,7 @@ disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path =
         {gun_response, Gun, Stream, nofin, Status, Headers} ->
             Hdrs = maps:from_list(Headers),
             #{<<"content-type">> := ContentType} = Hdrs,
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
             ErrInfo = case ContentType of
                 <<"application/json">> -> {http, Status, jsx:decode(Body, [return_maps])};
                 _ -> {http, Status, Body}
@@ -308,7 +308,7 @@ flowing({call, From}, close, #state{gun = Gun, stream = Stream}) ->
             {stop, normal};
         {response, nofin, Status, Headers} when (Status >= 300) ->
             Hdrs = maps:from_list(Headers),
-            {ok, Body} = gun_data_h:await_body(Gun, Stream, 30000),
+            {ok, Body} = sftp_manta_gun:await_body(Gun, Stream, 30000),
             ErrInfo = case Hdrs of
                 #{<<"content-type">> := <<"application/json">>} ->
                     {http, Status, jsx:decode(Body, [return_maps])};
