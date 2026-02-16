@@ -93,6 +93,13 @@ handle_msg({ssh_channel_up, ChanId, ConnMgr} = Msg,
             {stop, StopChanId, S0#?MODULE{sftpd_state = SS2}}
     end;
 
+handle_msg({gun_down, Pid, _Proto, _Why, _Extra}, S0) ->
+    lager:debug("gun down: ~p", [Pid]),
+    {ok, S0};
+handle_msg({gun_up, Pid, _Proto}, S0) ->
+    lager:debug("gun up: ~p", [Pid]),
+    {ok, S0};
+
 handle_msg(Msg, S0 = #?MODULE{sftpd_state = SS0}) ->
     case ssh_sftpd:handle_msg(Msg, SS0) of
         {ok, SS1} ->

@@ -196,6 +196,7 @@ disconnected({call, From}, connect, S0 = #state{host = Host, port = Port, path =
     Dur = dur_level(Path),
     InHdrs = #{
         <<"content-type">> => Mime,
+        <<"max-content-length">> => <<"26843545600">>,
         <<"expect">> => <<"100-continue">>,
         <<"durability-level">> => Dur
     },
